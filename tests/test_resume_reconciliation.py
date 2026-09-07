@@ -123,6 +123,22 @@ def test_already_playing_never_starts_twice(runtime):
     assert runtime.coord._playback_health == "healthy"
 
 
+def test_disabled_recovery_preserves_safety_cancellation_during_health_check(runtime):
+    runtime.coord._opts[C.CONF_PLAYBACK_RECOVERY] = False
+    for state in runtime.states.values():
+        state.state = "playing"
+
+    def stop_during_samples():
+        if runtime.now > 3.0:
+            runtime.inputs = replace(runtime.inputs, stop_latch=True)
+
+    runtime.on_wait = stop_during_samples
+    run_resume(runtime)
+    assert runtime.coord._playback_recovery_stage == "cancelled"
+    assert runtime.coord._playback_health == "inactive"
+    assert runtime.coord._log[0]["executed"] is False
+
+
 def test_successful_dispatch_still_idle_is_failed_and_not_periodically_retried(runtime):
     runtime.replace_plays = False
     run_resume(runtime)

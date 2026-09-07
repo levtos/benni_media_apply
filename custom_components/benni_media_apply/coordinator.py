@@ -1543,6 +1543,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not self._playback_recovery_enabled:
                 if is_resume:
                     health = await self._stable_playback_health()
+                    if health.state == "cancelled":
+                        return
                     self._set_playback_recovery("healthy" if health.state == "healthy" else "failed", health=health.state, reason=health.reason)
                 else:
                     self._set_playback_recovery("complete", health="unmonitored")
