@@ -212,6 +212,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_bio_state: str | None = None
         self._radio_resume_task: Optional[asyncio.Task] = None
         self._radio_dispatch_state = logic.RadioDispatchState()
+        self._radio_dispatch_payload: dict[str, Any] = {}
         # #41 — genau ein Besitzer für Wake-Start + gestufte Recovery.
         self._playback_recovery_task: Optional[asyncio.Task] = None
         self._stuck_mute_task: Optional[asyncio.Task] = None
@@ -221,6 +222,9 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._stuck_mute_retry_not_before = 0.0
         self._playback_recovery_source: str | None = None
         self._wake_start_owned = False
+        self._playback_action_log: dict[str, Any] | None = None
+        self._resume_episode_finished = False
+        self._resume_episode_station: str | None = None
         self._playback_health = "idle"
         self._playback_health_reason: str | None = None
         self._playback_recovery_stage = "idle"
@@ -549,6 +553,10 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _compute(self, *, force_execute: bool = False) -> dict[str, Any]:
         inputs = self._build_inputs()
+        # Only a real interruption ends the previous resume episode. Player
+        # flaps or a transient action=none must not re-arm failed recovery.
+        if logic.playback_repair_block_reason(inputs, managed_episode=True) is not None:
+            self._resume_episode_finished = False
         media_blocked = logic.media_block_reason(inputs) is not None
         if self._playback_recovery_stage == "initial_start":
             recovery_block = logic.playback_start_block_reason(
@@ -558,7 +566,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             recovery_block = logic.playback_repair_block_reason(
                 inputs,
                 managed_episode=self._wake_start_owned,
-                require_positive_target=self._playback_recovery_stage != "settling",
+                require_positive_target=(self._playback_recovery_stage != "settling" or self._playback_recovery_source != "wake"),
             )
         if self._wake_start_owned and recovery_block is not None:
             self._cancel_playback_recovery(recovery_block)
@@ -608,6 +616,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         wplan = logic.decide_wake(edge_inp)
         wake_radio_start = bool(
             wplan.fire
+            and not self._wake_start_owned
             and self.apply_enabled
             and self._radio_autostart_enabled
             and logic.should_autostart_radio(inputs)
@@ -884,7 +893,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "denon_target": plan.denon_set,
             "subwoofer_set": plan.subwoofer_set,
             "quiet": plan.quiet_override,
-            "executed": plan.execute,
+            "execution_requested": plan.execute,
+            "executed": plan.execute and plan.homepods_action not in (ACTION_RESUME, ACTION_START_RADIO),
         })
 
     def status(self) -> dict[str, Any]:
@@ -1069,9 +1079,9 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if plan.homepods_action == ACTION_PAUSE:
                 await self._svc("media_player", "media_pause", {"entity_id": hp})
             elif plan.homepods_action == ACTION_RESUME:
-                await self._svc("media_player", "media_play", {"entity_id": hp})
+                self._schedule_resume_reconciliation(source="tv_resume")
             elif plan.homepods_action == ACTION_START_RADIO:
-                await self._dispatch_automatic_radio(plan.radio_uri, source="policy")
+                self._schedule_resume_reconciliation(source="policy")
 
         # ----- HomePods-Volume (Ramp oder direkt) — PRO POD (benni_media#16) -----
         vol_targets = self._homepods_volume_targets()
@@ -1155,16 +1165,41 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @callback
     def _schedule_radio_autostart(self) -> None:
+        if self._playback_recovery_task is not None and not self._playback_recovery_task.done():
+            return
         self._cancel_playback_recovery("new_wake")
         self._wake_start_owned = True
         self._playback_health = "settling"
         self._playback_health_reason = None
         self._playback_recovery_stage = "initial_start"
+        self._playback_recovery_source = "wake"
+        self._playback_action_log = None
         self._playback_recovery_attempts = 0
         self._playback_recovery_started_at = self.hass.loop.time()
         self._playback_recovery_task = self.hass.async_create_task(
             self._run_radio_autostart()
         )
+
+    @callback
+    def _schedule_resume_reconciliation(self, *, source: str) -> None:
+        """Claim the existing single flight before any resume/replace side effect."""
+        inp = self._build_inputs()
+        if self._wake_start_owned or (self._resume_episode_finished and inp.radio_station == self._resume_episode_station):
+            return
+        reason = logic.playback_start_block_reason(inp) or logic.playback_repair_block_reason(inp, managed_episode=True)
+        if reason is not None:
+            self._set_playback_recovery("cancelled", health="inactive", reason=reason)
+            return
+        self._cancel_radio_resume()
+        self._cancel_stuck_mute_recovery()
+        self._wake_start_owned = True  # compatibility name for the shared owner
+        self._resume_episode_station = inp.radio_station
+        self._playback_recovery_source = source
+        self._playback_recovery_started_at = self.hass.loop.time()
+        self._playback_recovery_attempts = 0
+        self._playback_action_log = next((row for row in self._log if row["action"] in (ACTION_RESUME, ACTION_START_RADIO)), None)
+        self._set_playback_recovery("settling", health="settling")
+        self._playback_recovery_task = self.hass.async_create_task(self._run_radio_autostart(source=source))
 
     @callback
     def _cancel_playback_recovery(self, reason: str) -> None:
@@ -1177,7 +1212,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._playback_recovery_stage = "cancelled"
             self._playback_health = "inactive"
             self._playback_health_reason = reason
-            self._playback_recovery_source = "wake"
+            if self._playback_action_log is not None:
+                self._playback_action_log.update(executed=False, playback_health="inactive", recovery_stage="cancelled", reason=reason)
 
     def _set_playback_recovery(
         self, stage: str, *, health: str | None = None, reason: str | None = None
@@ -1186,6 +1222,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if health is not None:
             self._playback_health = health
         self._playback_health_reason = reason
+        if self._playback_action_log is not None:
+            self._playback_action_log.update(executed=health == "healthy", playback_health=self._playback_health, recovery_stage=stage, reason=reason)
         if self.data is not None:
             self.async_set_updated_data({
                 **self.data,
@@ -1200,6 +1238,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "source": self._playback_recovery_source,
             "attempts": self._playback_recovery_attempts,
             "wake_start_owned": self._wake_start_owned,
+            "single_flight_owner": self._wake_start_owned,
             "backstop_interval_seconds": DEFAULT_STUCK_MUTE_BACKSTOP_INTERVAL,
             "unmute_cooldown_remaining_seconds": round(
                 max(0.0, self._stuck_mute_retry_not_before - self.hass.loop.time()),
@@ -1449,11 +1488,12 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self._stuck_mute_task is asyncio.current_task():
                 self._stuck_mute_task = None
 
-    async def _run_radio_autostart(self) -> None:
+    async def _run_radio_autostart(self, *, source: str = "wake") -> None:
         """Single-flight Wake-Start with soft and optional hard recovery (#41)."""
-        self._playback_recovery_source = "wake"
+        self._playback_recovery_source = source
+        is_resume = source != "wake"
         latch = self._entity_id(CONF_STOP_LATCH)
-        if latch:
+        if latch and not is_resume:
             await self._svc(
                 "homeassistant", "turn_off", {"entity_id": latch}, blocking=True
             )
@@ -1461,7 +1501,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Volume-Floor (0.10, blockierend). Kurzer Vorlauf, damit der Floor anliegt,
         # bevor wir Ton ausgeben — sonst Burst bei alter Lautstärke (FLEET-42).
         lead = self._duration(CONF_WAKE_PLAY_LEAD, DEFAULT_WAKE_PLAY_LEAD)
-        if lead > 0:
+        if lead > 0 and not is_resume:
             try:
                 await asyncio.sleep(lead)
             except asyncio.CancelledError:
@@ -1469,29 +1509,45 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             inp = self._build_inputs()
             reason = logic.playback_start_block_reason(
-                inp, require_positive_target=False
+                inp, require_positive_target=is_resume
             )
+            if is_resume:
+                reason = reason or logic.playback_repair_block_reason(inp, managed_episode=True)
             if reason is not None:
                 self._set_playback_recovery(
                     "cancelled", health="inactive", reason=reason
                 )
                 return
             uri = logic.resolve_radio_uri(inp.radio_station)
-            if logic.should_autostart_radio(inp):
-                await self._dispatch_automatic_radio(uri, source="wake_autostart")
+            if source == "tv_resume":
+                if self._state(CONF_HOMEPODS_PLAYER) not in PLAYER_PLAYING_VALUES:
+                    try:
+                        await self.hass.services.async_call("media_player", "media_play", {"entity_id": self._entity_id(CONF_HOMEPODS_PLAYER)}, blocking=True)
+                        if self._playback_action_log is not None:
+                            self._playback_action_log["dispatched"] = True
+                    except Exception as err:  # noqa: BLE001
+                        self._playback_health_reason = f"resume_dispatch_failed:{type(err).__name__}"
+            elif logic.should_autostart_radio(inp):
+                await self._dispatch_automatic_radio(uri, source="wake_autostart" if not is_resume else source)
 
             # play_media startet selbst. Nach kurzem Settle explizit entstummen;
             # der alte zusätzliche media_play-Impuls war Teil des Lock-Races.
             self._set_playback_recovery("settling", health="settling")
-            if not await self._recovery_sleep(2.0, require_positive_target=False):
+            if not await self._recovery_sleep(2.0, require_positive_target=is_resume):
                 return
             if await self._wait_for_playing_homepods():
                 await self._unmute_homepods(
-                    source="wake_initial", force_all=True
+                    source=f"{source}_initial", force_all=True
                 )
 
             if not self._playback_recovery_enabled:
-                self._set_playback_recovery("complete", health="unmonitored")
+                if is_resume:
+                    health = await self._stable_playback_health()
+                    if health.state == "cancelled":
+                        return
+                    self._set_playback_recovery("healthy" if health.state == "healthy" else "failed", health=health.state, reason=health.reason)
+                else:
+                    self._set_playback_recovery("complete", health="unmonitored")
                 return
 
             settle = self._duration(
@@ -1513,17 +1569,20 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._set_playback_recovery(
                 "soft_recovery", health=health.state, reason=health.reason
             )
-            await self._dispatch_automatic_radio(
+            dispatched = await self._dispatch_automatic_radio(
                 uri,
-                source="wake_soft_recovery",
+                source=f"{source}_soft_recovery",
                 replace_existing=True,
                 bypass_circuit=True,
             )
+            if is_resume and not dispatched:
+                self._set_playback_recovery("failed", health="unhealthy", reason=self._radio_dispatch_state.last_error or "recovery_dispatch_blocked")
+                return
             if not await self._recovery_sleep(2.0):
                 return
             if await self._wait_for_playing_homepods():
                 await self._unmute_homepods(
-                    source="wake_soft_recovery", force_all=True
+                    source=f"{source}_soft_recovery", force_all=True
                 )
             if not await self._recovery_sleep(DEFAULT_PLAYBACK_RECOVERY_RECHECK):
                 return
@@ -1532,6 +1591,12 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return
             if health.state == "healthy":
                 self._set_playback_recovery("healthy", health="healthy")
+                return
+
+            if is_resume:
+                # Normal resume has one bounded replace, no periodic recovery
+                # and no implicit extension of the Wake-only app restart gate.
+                self._set_playback_recovery("failed", health=health.state, reason=health.reason)
                 return
 
             hard_after = self._duration(
@@ -1574,6 +1639,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self._playback_recovery_task is asyncio.current_task():
                 self._playback_recovery_task = None
                 self._wake_start_owned = False
+                if is_resume:
+                    self._resume_episode_finished = True
 
     async def _restart_music_assistant(
         self, uri: str | None, health: logic.PlaybackHealth
@@ -1680,6 +1747,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "failure_count": state.consecutive_failures,
             "last_source": state.last_source,
             "last_error": state.last_error,
+            "payload": self._radio_dispatch_payload,
         }
 
     async def _dispatch_automatic_radio(
@@ -1692,7 +1760,25 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> bool:
         """Dispatch one automatic radio start through the shared circuit breaker."""
         hp = self._entity_id(CONF_HOMEPODS_PLAYER)
-        if not hp:
+        self._radio_dispatch_payload = {
+            "target_bound": isinstance(hp, str) and hp.startswith("media_player."),
+            "media_id_present": bool(media_id),
+            "media_id_type": type(media_id).__name__,
+            "media_scheme": next((scheme for scheme in ("http", "https", "radiobrowser", "library") if isinstance(media_id, str) and media_id.startswith(scheme + "://")), "other" if media_id else None),
+            "media_type": RADIO_MEDIA_TYPE,
+            "enqueue": RADIO_ENQUEUE,
+            "source": source,
+        }
+        # Owned starts cannot delegate to a script that may add another play.
+        invalid = None
+        if not isinstance(hp, str) or not hp.startswith("media_player.") or self.hass.states.get(hp) is None:
+            invalid = "target_player_missing_or_invalid"
+        elif self._wake_start_owned and not media_id:
+            invalid = "media_id_missing"
+        elif media_id is not None and (not isinstance(media_id, str) or "://" not in media_id or not media_id.split("://", 1)[1] or any(char.isspace() for char in media_id)):
+            invalid = "media_id_invalid"
+        if invalid:
+            self._radio_dispatch_result(success=False, error=ValueError(invalid))
             return False
         inp = self._build_inputs()
         recovery_block = (
@@ -1735,17 +1821,20 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "script", "turn_on", {"entity_id": radio}, blocking=True
                 )
             self._radio_dispatch_result(success=True)
+            if self._playback_action_log is not None:
+                self._playback_action_log["dispatched"] = True
             _LOGGER.info(
                 "media_apply: automatic radio dispatch (%s) → %s",
                 source,
-                media_id or "script",
+                self._radio_dispatch_payload["media_scheme"] if media_id else "script",
             )
             return True
         except asyncio.CancelledError:
             raise
         except Exception as err:  # noqa: BLE001 — provider failure is circuit-breaker input.
-            self._radio_dispatch_result(success=False, error=err)
-            _LOGGER.warning("media_apply: automatic radio dispatch (%s) failed: %s", source, err)
+            safe_error = RuntimeError(f"provider_dispatch_failed:{type(err).__name__}")
+            self._radio_dispatch_result(success=False, error=safe_error)
+            _LOGGER.warning("media_apply: automatic radio dispatch (%s) failed: %s", source, safe_error)
             return False
 
     async def _run_radio_resume(self) -> None:
@@ -1763,8 +1852,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         latch_on = _bool(self._state(CONF_STOP_LATCH))
         if latch_on or not logic.should_autostart_radio(inp) or inp.action == ACTION_PAUSE:
             return
-        uri = logic.resolve_radio_uri(inp.radio_station)
-        await self._dispatch_automatic_radio(uri, source="resume")
+        self._schedule_resume_reconciliation(source="resume")
 
     async def _execute_tv_wol(self) -> None:
         """R12: TV einschalten. `media_player.turn_on` löst das webOS-„Leuchtfeuer"
