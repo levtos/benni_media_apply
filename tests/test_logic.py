@@ -765,14 +765,14 @@ def _twol(**kw):
 
 
 def test_tv_wol_fires_on_screen_when_tv_off():
-    p, s = L.decide_tv_wol(_twol(media_device="tv", tv_player_state="off"))
+    p, s = L.decide_tv_wol(_twol(media_device="tv", tv_player_state="off"), L.TvWolState(initialized=True))
     assert p.fire is True
     assert s.fired is True
     assert "r12:tv_on" in p.reasons
 
 
 def test_tv_wol_fires_for_appletv_too():
-    p, _ = L.decide_tv_wol(_twol(media_device="appletv", tv_player_state="standby"))
+    p, _ = L.decide_tv_wol(_twol(media_device="appletv", tv_player_state="standby"), L.TvWolState(initialized=True))
     assert p.fire is True
 
 
@@ -783,11 +783,12 @@ def test_tv_wol_no_refire_while_armed():
     assert ns.fired is True
 
 
-def test_tv_wol_resets_when_tv_turns_on():
+def test_tv_wol_does_not_reset_when_tv_turns_on():
     s = L.TvWolState(fired=True)
     p, ns = L.decide_tv_wol(_twol(media_device="tv", tv_player_state="playing"), s)
     assert p.fire is False
-    assert ns.fired is False
+    assert ns.fired is True
+    assert not ns.wol_available
 
 
 def test_tv_wol_resets_when_leaving_screen():
@@ -810,7 +811,7 @@ def test_tv_wol_no_fire_on_unknown_tv_state():
 
 def test_tv_wol_wattage_fallback_fires():
     # WebOS unavailable → Wattage-Fallback (tv_power_on False = aus) → feuern.
-    p, _ = L.decide_tv_wol(_twol(media_device="tv", tv_player_state="unavailable", tv_power_on=False))
+    p, _ = L.decide_tv_wol(_twol(media_device="tv", tv_player_state="unavailable", tv_power_on=False), L.TvWolState(initialized=True))
     assert p.fire is True
 
 

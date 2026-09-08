@@ -107,8 +107,13 @@ Analyse-Stand 2026-06-11 (alter Layer: `einhornzentrale/packages/media/`):
   Bedient wird beides über das Umbrella-Write-Gateway (`apply/play_radio|search_radio`).
 - **Phase 4c — TV-WoL (R12) ✅ (0.10.0):** Wechsel auf ein Bildschirm-Szenario
   (`media_device` ∈ {tv, appletv}) bei ausgeschaltetem TV → TV einschalten, **sofort
-  (kein Debounce)**, edge-getriggert (feuert 1× pro Episode, Reset bei TV an / kein
-  Bildschirm). TV-Power R11: WebOS-State (off/standby) primär, Wattage-Fallback.
+  (kein Debounce)**, höchstens 1× pro beobachteter Screen-Episode. **#46 (0.19.9):**
+  TV an verbraucht die Wake-Berechtigung, beendet aber nicht die Episode; TV-Off
+  ist nie ein neuer Wake-Intent. Erst eindeutig Non-Screen → später tv/appletv
+  erlaubt erneut WOL. Startup mit bestehendem Screen bleibt fail-safe gesperrt;
+  unknown/unavailable beendet keine Episode. Sleep-TV-Off invalidiert auch
+  eingeplante Wake-Tasks. [R12-Episode-Vertrag](docs/issue-46-tv-wol-episode.md).
+  TV-Power R11: WebOS-State (off/standby) primär, Wattage-Fallback.
   Aktion: `media_player.turn_on` (löst das webOS-„Leuchtfeuer" aus — die WoL-Automation
   bleibt 24/7, die LG-Integration braucht sie für den On/Off-Status) **+ optionale
   variable MAC** (`tv_wol_mac`) → eigenes `wake_on_lan.send_magic_packet`. **Apply-gated**
