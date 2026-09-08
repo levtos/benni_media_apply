@@ -657,7 +657,12 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._apply_nachlauf(nplan)
         # R12 TV-WoL: SOFORT (kein Debounce), aber apply-gated (automatische Aktion).
         if twol.fire and self.apply_enabled:
-            self.hass.async_create_task(self._execute_tv_wol())
+            self.hass.async_create_task(
+                self._execute_tv_wol(self._tv_wol_state.episode_id)
+            )
+        elif twol.fire:
+            self._tv_wol_state.consume("r12:shadow")
+            self._tv_wol_state.suppressed_reason = "r12:shadow"
         # Issue #59: reconcile persisted absolute deadlines instead of starting
         # relative RAM timers on every arm/extension.
         self._reconcile_sleep_tv_tasks()
@@ -963,12 +968,12 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "tasks": sorted(self._nachlauf_tasks),
             },
             "tv_wol": {
-                "fired": self._tv_wol_state.fired,
+                **self._tv_wol_state.as_dict(),
                 "media_device": inp.media_device,
                 "tv_player_state": inp.tv_player_state,
                 "is_screen": inp.media_device in SCREEN_DEVICES,
                 "screen_devices": list(SCREEN_DEVICES),
-                "mac": str(self._opts.get(CONF_TV_WOL_MAC, DEFAULT_TV_WOL_MAC) or "") or None,
+                "mac_configured": bool(self._opts.get(CONF_TV_WOL_MAC)),
             },
             "sleep_tv": {
                 "armed": self._sleep_tv_state.armed,
@@ -1854,17 +1859,43 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         self._schedule_resume_reconciliation(source="resume")
 
-    async def _execute_tv_wol(self) -> None:
+    def _tv_wol_block_reason(self, episode_id: int) -> str | None:
+        """Recheck this task's permission immediately before each side effect."""
+        state = self._tv_wol_state
+        if state.episode_id != episode_id or not state.episode_active:
+            return "r12:episode_ended"
+        if state.last_consume_reason != "r12:wake_requested":
+            return state.last_consume_reason or "r12:episode_consumed"
+        if not self.apply_enabled:
+            return "r12:shadow"
+        inp = self._build_inputs()
+        if logic.tv_screen_intent(inp) is not True:
+            return "r12:screen_intent_changed"
+        if logic._tv_is_off(inp) is not True:
+            return "r12:tv_not_confirmed_off"
+        return None
+
+    async def _execute_tv_wol(self, episode_id: int) -> None:
         """R12: TV einschalten. `media_player.turn_on` löst das webOS-„Leuchtfeuer"
         aus (bleibt 24/7); ist zusätzlich eine MAC konfiguriert, sendet media_apply
         das Magic-Packet selbst (variabel pflegbar)."""
+        if episode_id != self._tv_wol_state.episode_id:
+            return  # An old task must not consume a newer episode's permission.
+        reason = self._tv_wol_block_reason(episode_id)
+        if reason:
+            self._tv_wol_state.consume(reason)
+            self._tv_wol_state.suppressed_reason = reason
+            return
+        if not self._tv_wol_state.pending:
+            return
+        self._tv_wol_state.pending = False  # claim before the first await
         tv = self._entity_id(CONF_TV_PLAYER)
         if tv:
             await self._svc("media_player", "turn_on", {"entity_id": tv})
         mac = str(self._opts.get(CONF_TV_WOL_MAC, DEFAULT_TV_WOL_MAC) or "").strip()
-        if mac:
+        if mac and self._tv_wol_block_reason(episode_id) is None:
             await self._svc("wake_on_lan", "send_magic_packet", {"mac": mac})
-        _LOGGER.info("media_apply: R12 TV-WoL → turn_on %s (mac=%s)", tv, mac or "—")
+        _LOGGER.info("media_apply: R12 wake dispatched for screen episode %s", episode_id)
 
     # ----- Wake-Sequenz (R23) + bio-Flanken -----
     def _bio_edges(self) -> tuple[bool, bool]:
@@ -2112,6 +2143,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self.apply_enabled:
             tv = self._entity_id(CONF_TV_PLAYER)
             if tv:
+                self._tv_wol_state.consume("r12:sleep_tv_off")
                 _LOGGER.info("media_apply: R24 Sleep-TV-Off abgelaufen → turn_off %s", tv)
                 await self._svc("media_player", "turn_off", {"entity_id": tv})
         else:

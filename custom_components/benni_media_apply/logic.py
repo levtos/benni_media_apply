@@ -1221,10 +1221,40 @@ def decide_private_exit(
 # --------------------------------------------------------------------------- #
 @dataclass
 class TvWolState:
-    """Edge-Buchwerk: True, sobald für die laufende Bildschirm-Episode der TV-On
-    schon ausgelöst wurde (verhindert WoL-Spam, bis TV an ODER Szenario verlässt)."""
+    """Private R12 episode; a restored screen is never a new wake request."""
 
     fired: bool = False
+    initialized: bool = False
+    episode_active: bool = False
+    episode_id: int = 0
+    wol_available: bool = False
+    pending: bool = False
+    screen_intent: Optional[bool] = None
+    last_tv_off: Optional[bool] = None
+    last_consume_reason: Optional[str] = None
+    last_rearm_reason: Optional[str] = None
+    suppressed_reason: Optional[str] = None
+
+    def consume(self, reason: str) -> None:
+        """Invalidate even queued wake work before an intentional TV-off."""
+        self.wol_available = False
+        self.pending = False
+        self.last_consume_reason = reason
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "fired": self.fired,
+            "initialized": self.initialized,
+            "episode_active": self.episode_active,
+            "episode_id": self.episode_id,
+            "screen_intent": self.screen_intent,
+            "wol_available": self.wol_available,
+            "wol_consumed": self.episode_active and not self.wol_available,
+            "pending": self.pending,
+            "last_consume_reason": self.last_consume_reason,
+            "last_rearm_reason": self.last_rearm_reason,
+            "suppressed_reason": self.suppressed_reason,
+        }
 
 
 @dataclass
@@ -1301,32 +1331,72 @@ def _sleep_tv_is_off(inp: "Inputs") -> Optional[bool]:
 def decide_tv_wol(
     inp: "Inputs", state: Optional[TvWolState] = None
 ) -> tuple[TvWolPlan, TvWolState]:
-    """R12 — Wechsel auf ein Bildschirm-Szenario (media_device ∈ SCREEN_DEVICES)
-    bei ausgeschaltetem TV → TV einschalten (sofort, kein Debounce). Edge-getriggert:
-    feuert genau EINMAL pro Episode; Reset, sobald TV an ist ODER das Szenario kein
-    Bildschirm mehr verlangt. Unbekannter TV-Zustand (None) feuert NICHT (fail-safe)."""
+    """R12: one wake after a witnessed non-screen -> screen transition.
+
+    TV-on satisfies (consumes) the episode, never re-arms it. Unknown intent
+    cannot certify an episode end. Startup with a screen fails closed, without
+    restoring permissions from storage or interpreting raw source metadata.
+    """
     if state is None:
         state = TvWolState()
     p = TvWolPlan()
-    ns = TvWolState(fired=state.fired)
-    reasons: list[str] = []
-
-    screen = inp.media_device in SCREEN_DEVICES
+    ns = replace(state, suppressed_reason=None)
+    # Existing Media State device enum; new/unrecognised values are not an end.
+    screen = tv_screen_intent(inp)
     tv_off = _tv_is_off(inp)
+    shutdown_edge = state.last_tv_off is False and tv_off is True
+    ns.screen_intent = screen
+    if tv_off is not None:
+        ns.last_tv_off = tv_off
 
-    if not screen or tv_off is False:
-        # Kein Bildschirm-Szenario oder TV ist an → Episode beendet, re-armen.
-        if ns.fired:
-            reasons.append("r12:reset")
+    if screen is False:
+        ns.initialized = True
+        ns.episode_active = False
+        ns.wol_available = False
+        ns.pending = False
         ns.fired = False
-    elif screen and tv_off is True and not ns.fired:
-        p.fire = True
-        ns.fired = True
-        reasons.append("r12:tv_on")
-    # screen & tv_off is None → unbekannt, nichts tun (fail-safe).
+    elif screen is None:
+        ns.consume("r12:screen_intent_unknown")
+        ns.suppressed_reason = "r12:screen_intent_unknown"
+    else:
+        if not ns.episode_active:
+            ns.episode_active = True
+            ns.episode_id += 1
+            ns.wol_available = ns.initialized
+            if ns.wol_available:
+                ns.last_rearm_reason = "r12:new_screen_episode"
+            else:
+                ns.consume("r12:startup_screen_unproven")
+        ns.initialized = True
+        if shutdown_edge:
+            ns.consume("r12:tv_shutdown_edge")
+        elif tv_off is False and (ns.wol_available or ns.pending):
+            ns.consume("r12:tv_already_on")
 
-    p.reasons = reasons
+    if screen is True and tv_off is True and ns.wol_available:
+        p.fire = True
+        ns.consume("r12:wake_requested")
+        ns.fired = True
+        ns.pending = True
+        p.reasons.append("r12:tv_on")
+    elif screen is True and tv_off is not False:
+        ns.suppressed_reason = (
+            "r12:tv_unknown" if tv_off is None
+            else ns.last_consume_reason or "r12:episode_consumed"
+        )
+    if ns.suppressed_reason:
+        p.reasons.append(ns.suppressed_reason)
+
     return p, ns
+
+
+def tv_screen_intent(inp: "Inputs") -> Optional[bool]:
+    """Consume the existing device enum; never arbitrate sources here."""
+    if inp.media_device in SCREEN_DEVICES:
+        return True
+    if inp.media_device in ("none", "denon", "homepods", "pc", "ps5", "switch"):
+        return False
+    return None
 
 
 # --------------------------------------------------------------------------- #

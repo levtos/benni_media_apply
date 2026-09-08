@@ -1,7 +1,7 @@
 {
   "domain": "benni_media_apply",
   "name": "Benni Media Apply",
-  "version": "0.19.8",
+  "version": "0.19.9",
   "documentation": "https://github.com/Levtos/benni_media_apply",
   "issue_tracker": "https://github.com/Levtos/benni_media_apply/issues",
   "codeowners": ["@Levtos"],
