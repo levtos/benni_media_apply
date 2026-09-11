@@ -19,6 +19,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from homeassistant.components.media_player import MediaPlayerEntityFeature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.event import (
@@ -1286,13 +1287,18 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         pod_muted: list[bool | None] = []
         for entity_id in pods:
             state = self.hass.states.get(entity_id)
-            pod_states.append(
+            pod_state = (
                 state.state
                 if state is not None and state.state not in ("unknown", "unavailable")
                 else None
             )
-            muted = state.attributes.get("is_volume_muted") if state is not None else None
-            pod_muted.append(muted if isinstance(muted, bool) else None)
+            pod_states.append(pod_state)
+            if pod_state is None:
+                pod_muted.append(None)
+            elif self._supports_volume_mute(state):
+                pod_muted.append(state.attributes["is_volume_muted"])
+            else:
+                pod_muted.append(False)
         group_state = (
                 group_obj.state
                 if group_obj is not None
@@ -1300,6 +1306,28 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 else None
             )
         return group_state, pods, pod_states, pod_muted
+
+    @staticmethod
+    def _supports_volume_mute(state: Any) -> bool:
+        """Return whether a reachable player exposes reliable mute control."""
+        if state is None:
+            return False
+        supported = state.attributes.get("supported_features")
+        muted = state.attributes.get("is_volume_muted")
+        return (
+            isinstance(supported, int)
+            and bool(supported & int(MediaPlayerEntityFeature.VOLUME_MUTE))
+            and isinstance(muted, bool)
+        )
+
+    def _mute_capable_homepods(
+        self, entity_ids: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        return tuple(
+            entity_id
+            for entity_id in entity_ids
+            if self._supports_volume_mute(self.hass.states.get(entity_id))
+        )
 
     def _playback_health_snapshot(self) -> logic.PlaybackHealth:
         group_state, _pods, pod_states, pod_muted = self._playback_member_snapshot()
@@ -1376,7 +1404,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if reason is not None:
             return logic.UnmuteResult("cancelled", 0, reason=reason)
         pods = tuple(self._homepods_volume_targets())
-        targets = pods if force_all else self._stuck_mute_targets()
+        requested = pods if force_all else self._stuck_mute_targets()
+        targets = self._mute_capable_homepods(requested)
         if not targets:
             return logic.UnmuteResult("not_needed", 0)
 
