@@ -37,3 +37,10 @@ from its generic error message and is not claimed fixed independently.
 Verification includes the real coordinator runner with fake HA services,
 player states and a deterministic clock, plus the full existing suite.
 Benni owns installation, restart and acoustic/behavioral Live verification.
+
+## Mute capability tolerance
+
+Players that do not advertise `VOLUME_MUTE`, or do not expose
+`is_volume_muted`, are treated as not muted while their player state remains
+available. They are excluded from explicit unmute calls. An unavailable or
+unknown player remains unhealthy; this does not relax the playback-state gate.

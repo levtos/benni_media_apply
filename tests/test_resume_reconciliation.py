@@ -18,9 +18,10 @@ import bma_logic as L
 @pytest.fixture
 def runtime(monkeypatch):
     modules = {}
-    for name in ("homeassistant", "homeassistant.config_entries", "homeassistant.core", "homeassistant.helpers", "homeassistant.helpers.event", "homeassistant.helpers.storage", "homeassistant.helpers.update_coordinator", "homeassistant.util", "homeassistant.util.dt"):
+    for name in ("homeassistant", "homeassistant.components", "homeassistant.components.media_player", "homeassistant.config_entries", "homeassistant.core", "homeassistant.helpers", "homeassistant.helpers.event", "homeassistant.helpers.storage", "homeassistant.helpers.update_coordinator", "homeassistant.util", "homeassistant.util.dt"):
         modules[name] = types.ModuleType(name)
         monkeypatch.setitem(sys.modules, name, modules[name])
+    modules["homeassistant.components.media_player"].MediaPlayerEntityFeature = types.SimpleNamespace(VOLUME_MUTE=8)
     modules["homeassistant.config_entries"].ConfigEntry = object
     core = modules["homeassistant.core"]
     core.CALLBACK_TYPE = core.Event = core.HomeAssistant = object
@@ -61,7 +62,7 @@ def runtime(monkeypatch):
     group = "media_player.group"
     pods = ["media_player.pod1", "media_player.pod2"]
     for entity in [group, *pods]:
-        env.states[entity] = types.SimpleNamespace(state="idle", attributes={"is_volume_muted": False})
+        env.states[entity] = types.SimpleNamespace(state="idle", attributes={"is_volume_muted": False, "supported_features": 8})
 
     async def service(domain, action, data, **kwargs):
         env.calls.append((domain, action, data))
@@ -217,6 +218,32 @@ def test_wake_single_flight_and_unmute_survive_falling_resume_permission(runtime
     assert runtime.inputs.homepods_resume_allowed is False
     assert all(state.attributes["is_volume_muted"] is False for state in runtime.states.values() if state is not runtime.states["media_player.group"])
     assert runtime.coord._playback_health == "healthy"
+
+
+@pytest.mark.parametrize("attributes", [{"supported_features": 0}, {"supported_features": 8}])
+def test_playing_pods_without_mute_control_are_healthy_and_not_unmuted(runtime, attributes):
+    for state in runtime.states.values():
+        state.state = "playing"
+    for entity in ("media_player.pod1", "media_player.pod2"):
+        runtime.states[entity].attributes = dict(attributes)
+
+    run_resume(runtime)
+
+    assert runtime.coord._playback_health == "healthy"
+    assert runtime.coord._playback_recovery_stage == "healthy"
+    assert not any(action == "volume_mute" for _, action, _ in runtime.calls)
+    assert not any(domain == "music_assistant" for domain, _, _ in runtime.calls)
+
+
+def test_unavailable_pod_without_mute_control_remains_unhealthy(runtime):
+    for state in runtime.states.values():
+        state.state = "playing"
+    runtime.states["media_player.pod2"].state = "unavailable"
+    runtime.states["media_player.pod2"].attributes = {"supported_features": 0}
+
+    health = runtime.coord._playback_health_snapshot()
+
+    assert health == L.PlaybackHealth("unhealthy", "pod_2_unavailable")
 
 
 @pytest.mark.parametrize("media_id", ["", "unknown", "radiobrowser://", "radio://bad value", 4])
