@@ -67,9 +67,9 @@ def test_helper_allows_volume_while_playing():
     assert L.homepods_volume_addressable(C.ACTION_NONE, "playing") is True
 
 
-def test_helper_allows_volume_on_start_and_resume():
+def test_helper_allows_wake_start_but_blocks_paused_resume():
     assert L.homepods_volume_addressable(C.ACTION_START_RADIO, "idle") is True
-    assert L.homepods_volume_addressable(C.ACTION_RESUME, "paused") is True
+    assert L.homepods_volume_addressable(C.ACTION_RESUME, "paused") is False
 
 
 # --------------------------------------------------------------------------- #
@@ -136,13 +136,13 @@ def test_start_radio_keeps_the_full_wake_ramp():
     assert p.homepods_levels[-1] == 0.45
 
 
-def test_resume_from_paused_keeps_its_ramp():
+def test_resume_from_paused_waits_for_playing_before_ramp():
     p = _plan(_inp(action=C.ACTION_RESUME, homepods_resume_allowed=True,
                    homepods_state="paused", homepods_volume=0.05,
                    homepods_target=0.45))
     assert p.homepods_action == C.ACTION_RESUME
-    assert p.homepods_ramp is True
-    assert p.homepods_levels[-1] == 0.45
+    assert p.homepods_ramp is False
+    assert p.homepods_levels == []
 
 
 def test_playing_group_still_ramps_normally():

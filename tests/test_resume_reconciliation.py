@@ -57,7 +57,7 @@ def runtime(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)
-    env = types.SimpleNamespace(now=1.0, calls=[], states={}, replace_plays=True, on_wait=None, provider_error=False)
+    env = types.SimpleNamespace(now=1.0, calls=[], states={}, replace_plays=True, on_wait=None, provider_error=False, media_play_count=0, resume_plays_at=None, resume_target_after_play=None)
     env.inputs = L.Inputs(apply_enabled=True, volume_apply_allowed=True, action=C.ACTION_RESUME, homepods_should_pause=False, homepods_resume_allowed=True, homepods_target=0.3, quiet_mode=False, presence_state="anwesend", away_gate=False, stop_latch=False, radio_ready=True, manual_playback=False, planned_station_playing=False, bio_sleep=False, bio_state="awake", tv_power_on=False, audio_owner="homepods", radio_station="gayfm")
     group = "media_player.group"
     pods = ["media_player.pod1", "media_player.pod2"]
@@ -66,12 +66,27 @@ def runtime(monkeypatch):
 
     async def service(domain, action, data, **kwargs):
         env.calls.append((domain, action, data))
+        if domain == "media_player" and action == "media_pause":
+            env.states[group].state = "paused"
+        if domain == "media_player" and action == "media_play":
+            env.media_play_count += 1
+            if env.resume_plays_at is not None and env.media_play_count >= env.resume_plays_at:
+                for state in env.states.values():
+                    state.state = "playing"
+                env.inputs = replace(
+                    env.inputs,
+                    homepods_resume_allowed=False,
+                    action=C.ACTION_NONE,
+                    homepods_target=env.resume_target_after_play or env.inputs.homepods_target,
+                )
         if domain == "music_assistant":
             if env.provider_error:
                 raise ValueError("private-url?token=must-not-appear")
             if env.replace_plays:
                 for state in env.states.values():
                     state.state = "playing"
+                env.states[group].attributes["media_content_id"] = data["media_id"]
+                env.states[group].attributes["media_content_type"] = data["media_type"]
                 env.inputs = replace(env.inputs, homepods_resume_allowed=False, action=C.ACTION_NONE, planned_station_playing=True)
         if action == "volume_mute":
             for entity in data["entity_id"]:
@@ -107,13 +122,109 @@ def run_resume(env):
     asyncio.run(run())
 
 
-def test_idle_resume_uses_one_replace_and_confirms_playing(runtime):
+def remember_content(env, media_id=None, media_type=None):
+    state = env.states["media_player.group"]
+    state.state = "playing"
+    if media_id is not None:
+        state.attributes["media_content_id"] = media_id
+    if media_type is not None:
+        state.attributes["media_content_type"] = media_type
+
+    async def pause():
+        await env.coord._execute(
+            L.ApplyPlan(homepods_action=C.ACTION_PAUSE, execute=True)
+        )
+
+    asyncio.run(pause())
+    env.calls.clear()
+
+
+def test_unknown_content_falls_back_to_planned_station_exactly_once(runtime):
+    remember_content(runtime)
     run_resume(runtime)
     starts = [(d, a) for d, a, _ in runtime.calls if a in ("media_play", "play_media")]
-    assert starts == [("media_player", "media_play"), ("music_assistant", "play_media")]
+    assert starts == [("music_assistant", "play_media")]
+    assert next(data["media_id"] for domain, action, data in runtime.calls if domain == "music_assistant" and action == "play_media") == L.resolve_radio_uri("gayfm")
     assert runtime.coord._playback_health == "healthy"
     assert runtime.coord._log[0]["executed"] is True
     assert runtime.coord._playback_recovery_source == "tv_resume"
+
+
+def test_remembered_radio_retries_same_uri_not_planned_station(runtime):
+    jack = "radiobrowser://station/jack"
+    remember_content(runtime, jack, "radio")
+    run_resume(runtime)
+    starts = [(d, a, data) for d, a, data in runtime.calls if a in ("media_play", "play_media")]
+    assert [(d, a) for d, a, _ in starts] == [("media_player", "media_play"), ("music_assistant", "play_media")]
+    assert starts[-1][2]["media_id"] == jack
+    assert starts[-1][2]["media_id"] != L.resolve_radio_uri("gayfm")
+    assert runtime.coord._playback_health == "healthy"
+
+
+@pytest.mark.parametrize("media_type", ["album", "playlist"])
+def test_remembered_album_or_playlist_retries_media_play(runtime, media_type):
+    remember_content(runtime, f"library://{media_type}/42", media_type)
+    runtime.resume_plays_at = 2
+    run_resume(runtime)
+    starts = [(d, a) for d, a, _ in runtime.calls if a in ("media_play", "play_media")]
+    assert starts == [("media_player", "media_play"), ("media_player", "media_play")]
+    assert runtime.coord._playback_health == "healthy"
+
+
+def test_target_zero_allows_owned_resume_then_ramp_after_playing(runtime):
+    remember_content(runtime, "radiobrowser://station/jack", "radio")
+    runtime.inputs = replace(runtime.inputs, homepods_target=0.0, manual_playback=True)
+    runtime.resume_plays_at = 1
+    runtime.resume_target_after_play = 0.4
+    run_resume(runtime)
+    assert [(d, a) for d, a, _ in runtime.calls if a in ("media_play", "play_media")] == [("media_player", "media_play")]
+    assert not any(action == "volume_set" for _, action, _ in runtime.calls)
+    assert runtime.coord._playback_health == "healthy"
+    ramp = L.decide_apply(
+        replace(
+            runtime.inputs,
+            homepods_state="playing",
+            homepods_volume=0.1,
+            homepods_configured=True,
+            manual_playback=False,
+        ),
+        L.ApplyState(),
+        L.RampSettings(),
+    )[0]
+    assert ramp.homepods_levels
+    assert ramp.homepods_levels[-1] == 0.4
+
+
+def test_manual_flag_keeps_owned_content_until_new_user_content(runtime):
+    jack = "radiobrowser://station/jack"
+    remember_content(runtime, jack, "radio")
+    runtime.inputs = replace(runtime.inputs, manual_playback=True)
+    runtime.resume_plays_at = 1
+    run_resume(runtime)
+    assert runtime.coord._playback_health == "healthy"
+
+    remember_content(runtime, jack, "radio")
+    runtime.inputs = replace(
+        runtime.inputs,
+        action=C.ACTION_RESUME,
+        homepods_resume_allowed=True,
+        manual_playback=True,
+        planned_station_playing=False,
+    )
+    runtime.media_play_count = 0
+    waits = 0
+
+    def user_change_after_owned_sample():
+        nonlocal waits
+        waits += 1
+        if waits >= 2:
+            runtime.states["media_player.group"].attributes["media_content_id"] = "radiobrowser://station/user-choice"
+
+    runtime.on_wait = user_change_after_owned_sample
+    run_resume(runtime)
+    assert runtime.coord._playback_recovery_stage == "cancelled"
+    assert runtime.coord._playback_health_reason == "resume_content_changed"
+    assert [(d, a) for d, a, _ in runtime.calls if a in ("media_play", "play_media")] == [("media_player", "media_play")]
 
 
 def test_already_playing_never_starts_twice(runtime):
@@ -155,13 +266,14 @@ def test_successful_dispatch_still_idle_is_failed_and_not_periodically_retried(r
 @pytest.mark.parametrize("change", [
     {"bio_state": "sleep", "bio_sleep": True}, {"bio_state": "provisional_sleep"},
     {"stop_latch": True}, {"away_gate": True}, {"action": C.ACTION_PAUSE},
-    {"homepods_target": 0.0}, {"audio_owner": "tv_denon"}, {"manual_playback": True},
+    {"audio_owner": "tv_denon"}, {"manual_playback": True},
     {"volume_apply_allowed": False}, {"suppress_homepods_start": True},
 ])
-def test_safety_change_during_settling_prevents_recovery(runtime, change):
-    runtime.on_wait = lambda: setattr(runtime, "inputs", replace(runtime.inputs, **change))
+def test_safety_gate_prevents_start_retry_and_volume(runtime, change):
+    runtime.inputs = replace(runtime.inputs, **change)
     run_resume(runtime)
-    assert not any(d == "music_assistant" for d, _, _ in runtime.calls)
+    assert not any(a in ("media_play", "play_media") for _, a, _ in runtime.calls)
+    assert not any(a == "volume_set" for _, a, _ in runtime.calls)
     assert runtime.coord._playback_recovery_stage == "cancelled"
     assert runtime.coord._playback_health == "inactive"
     assert runtime.coord._log[0]["executed"] is False

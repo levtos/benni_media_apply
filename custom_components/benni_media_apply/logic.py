@@ -688,7 +688,7 @@ def homepods_volume_addressable(action: str, hp_state: Optional[str]) -> bool:
     """
     if action == ACTION_PAUSE:
         return False
-    if action in (ACTION_RESUME, ACTION_START_RADIO):
+    if action == ACTION_START_RADIO:
         return True
     return hp_state in PLAYER_PLAYING_VALUES
 
