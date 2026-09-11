@@ -9,7 +9,7 @@ Der Denon wird nie per `volume_set(0)` stummgeschaltet (nur bei Ziel > 0 gesetzt
 benni_media#16 — sonst würde der frisch per CEC eingeschaltete AVR im
 Kontext-Übergangsfenster kurz auf 0 gezogen); physisches Aus läuft über die
 Denon-Off-Aktion, nicht über Lautstärke 0.
-Volume-Befehle gehen nur an eine spielende bzw. gerade gestartete HomePod-Gruppe,
+Volume-Befehle gehen nur an eine spielende bzw. per `start_radio` gerade gestartete HomePod-Gruppe,
 nie an eine pausierte/idle (benni_media#16 — `volume_set` weckt den AirPlay-Player
 und ist dort unhörbar; Pause ist der Stop-Mechanismus, nicht `volume 0`).
 HomePods-Volume/Ramp adressiert die **einzelnen Pods** (`homepods_pod_entities`,
