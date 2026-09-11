@@ -231,6 +231,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._resume_episode_expected_content_id: str | None = None
         self._resume_episode_seen_playing = False
         self._resume_episode_dispatched = False
+        self._playback_episode_admitted = False
+        self._playback_episode_seen_playing = False
         self._playback_health = "idle"
         self._playback_health_reason: str | None = None
         self._playback_recovery_stage = "idle"
@@ -561,20 +563,23 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         inputs = self._build_inputs()
         media_blocked = logic.media_block_reason(inputs) is not None
         if self._playback_recovery_stage == "initial_start":
-            recovery_block = logic.playback_start_block_reason(
-                inputs, require_positive_target=False
-            )
+            if self._playback_episode_admitted and self._episode_group_has_played():
+                recovery_block = self._playback_repair_block_reason(
+                    inputs,
+                    managed_episode=self._wake_start_owned,
+                    require_positive_target=True,
+                )
+            else:
+                recovery_block = self._playback_start_block_reason(
+                    inputs,
+                    source=self._playback_recovery_source or "wake",
+                    admission=not self._playback_episode_admitted,
+                )
         else:
             recovery_block = self._playback_repair_block_reason(
                 inputs,
                 managed_episode=self._wake_start_owned,
-                require_positive_target=(
-                    self._playback_recovery_source != "tv_resume"
-                    and (
-                        self._playback_recovery_stage != "settling"
-                        or self._playback_recovery_source != "wake"
-                    )
-                ),
+                require_positive_target=False,
             )
         if self._wake_start_owned and recovery_block is not None:
             self._cancel_playback_recovery(recovery_block)
@@ -1099,7 +1104,12 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # ----- HomePods-Volume (Ramp oder direkt) — PRO POD (benni_media#16) -----
         vol_targets = self._homepods_volume_targets()
-        if plan.homepods_levels and vol_targets:
+        idle_policy_start = (
+            plan.homepods_action == ACTION_START_RADIO
+            and self._state(CONF_HOMEPODS_PLAYER) not in PLAYER_PLAYING_VALUES
+            and self._playback_recovery_source != "wake"
+        )
+        if plan.homepods_levels and vol_targets and not idle_policy_start:
             self._cancel_ramp()
             if plan.homepods_ramp:
                 self._ramp_task = self.hass.async_create_task(
@@ -1182,7 +1192,16 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._playback_recovery_task is not None and not self._playback_recovery_task.done():
             return
         self._cancel_playback_recovery("new_wake")
+        inp = self._build_inputs()
+        reason = self._playback_start_block_reason(
+            inp, source="wake", admission=True
+        )
+        if reason is not None:
+            self._set_playback_recovery("cancelled", health="inactive", reason=reason)
+            return
         self._wake_start_owned = True
+        self._playback_episode_admitted = True
+        self._playback_episode_seen_playing = False
         self._playback_health = "settling"
         self._playback_health_reason = None
         self._playback_recovery_stage = "initial_start"
@@ -1206,14 +1225,9 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "cancelled", health="inactive", reason="resume_content_changed"
             )
             return
-        require_positive_target = source != "tv_resume"
         start_inp = self._resume_start_inputs(inp, source)
-        reason = logic.playback_start_block_reason(
-            start_inp, require_positive_target=require_positive_target
-        ) or self._playback_repair_block_reason(
-            start_inp,
-            managed_episode=True,
-            require_positive_target=require_positive_target,
+        reason = self._playback_start_block_reason(
+            start_inp, source=source, admission=True
         )
         if reason is not None:
             self._set_playback_recovery("cancelled", health="inactive", reason=reason)
@@ -1221,6 +1235,10 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._cancel_radio_resume()
         self._cancel_stuck_mute_recovery()
         self._wake_start_owned = True  # compatibility name for the shared owner
+        self._playback_episode_admitted = True
+        self._playback_episode_seen_playing = (
+            self._state(CONF_HOMEPODS_PLAYER) in PLAYER_PLAYING_VALUES
+        )
         self._resume_episode_expected_content_id = self._resume_content_id
         self._resume_episode_seen_playing = False
         self._resume_episode_dispatched = False
@@ -1238,6 +1256,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             task.cancel()
         self._playback_recovery_task = None
         self._wake_start_owned = False
+        self._playback_episode_admitted = False
+        self._playback_episode_seen_playing = False
         if self._playback_recovery_stage not in ("idle", "healthy", "failed"):
             self._playback_recovery_stage = "cancelled"
             self._playback_health = "inactive"
@@ -1278,6 +1298,47 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _managed_playback_episode(self, inp: logic.Inputs) -> bool:
         return self._wake_start_owned or inp.planned_station_playing is True
+
+    def _episode_group_has_played(self) -> bool:
+        if self._playback_episode_seen_playing:
+            return True
+        if self._state(CONF_HOMEPODS_PLAYER) in PLAYER_PLAYING_VALUES:
+            self._playback_episode_seen_playing = True
+        return self._playback_episode_seen_playing
+
+    def _playback_start_block_reason(
+        self,
+        inp: logic.Inputs,
+        *,
+        source: str,
+        admission: bool,
+    ) -> str | None:
+        """Apply the one-time episode admission rule before a start side effect."""
+        seen_playing = self._episode_group_has_played()
+        owner = (inp.audio_owner or "").strip().lower()
+        gate_inp = self._resume_start_inputs(inp, source)
+        if owner in ("", "none") and not seen_playing:
+            gate_inp = replace(gate_inp, audio_owner="homepods")
+        if not admission or source == "policy":
+            gate_inp = replace(gate_inp, homepods_resume_allowed=True)
+        reason = logic.playback_start_block_reason(
+            gate_inp, require_positive_target=False
+        )
+        if reason is not None:
+            return reason
+        if inp.homepods_should_pause:
+            return "policy_pause"
+        if inp.bio_state in BIO_SLEEP_CONTEXT_VALUES:
+            return "sleep_context"
+        if not inp.volume_apply_allowed:
+            return "volume_apply_not_allowed"
+        if owner in ("unknown", "unavailable"):
+            return "audio_owner_unproven"
+        if seen_playing and (
+            inp.homepods_target is None or inp.homepods_target <= 0.0
+        ):
+            return "non_positive_target"
+        return None
 
     @staticmethod
     def _media_content_value(state_obj: Any, attribute: str) -> str | None:
@@ -1335,6 +1396,19 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         managed_episode: bool,
         require_positive_target: bool = True,
     ) -> str | None:
+        episode_active = managed_episode and self._wake_start_owned
+        if not episode_active:
+            return logic.playback_repair_block_reason(
+                inp,
+                managed_episode=managed_episode,
+                require_positive_target=require_positive_target,
+            )
+        seen_playing = self._episode_group_has_played()
+        owner = (inp.audio_owner or "").strip().lower()
+        if owner in ("unknown", "unavailable"):
+            return "audio_owner_unproven"
+        if owner in ("", "none") and not seen_playing:
+            inp = replace(inp, audio_owner="homepods")
         override = self._resume_user_override_reason()
         if override is not None:
             return override
@@ -1357,7 +1431,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return logic.playback_repair_block_reason(
             inp,
             managed_episode=managed_episode,
-            require_positive_target=require_positive_target,
+            require_positive_target=seen_playing,
         )
 
     def _resume_start_inputs(self, inp: logic.Inputs, source: str) -> logic.Inputs:
@@ -1667,7 +1741,6 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Single-flight Wake-Start with soft and optional hard recovery (#41)."""
         self._playback_recovery_source = source
         is_resume = source != "wake"
-        require_positive_target = is_resume and source != "tv_resume"
         latch = self._entity_id(CONF_STOP_LATCH)
         if latch and not is_resume:
             await self._svc(
@@ -1685,20 +1758,24 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             inp = self._build_inputs()
             start_inp = self._resume_start_inputs(inp, source)
-            reason = logic.playback_start_block_reason(
-                start_inp, require_positive_target=require_positive_target
-            )
-            if is_resume:
-                reason = reason or self._playback_repair_block_reason(
+            if self._playback_episode_admitted and self._episode_group_has_played():
+                reason = self._playback_repair_block_reason(
                     start_inp,
                     managed_episode=True,
-                    require_positive_target=require_positive_target,
+                    require_positive_target=True,
+                )
+            else:
+                reason = self._playback_start_block_reason(
+                    start_inp,
+                    source=source,
+                    admission=not self._playback_episode_admitted,
                 )
             if reason is not None:
                 self._set_playback_recovery(
                     "cancelled", health="inactive", reason=reason
                 )
                 return
+            self._playback_episode_admitted = True
             uri = logic.resolve_radio_uri(inp.radio_station)
             fallback_dispatched = False
             if source == "tv_resume":
@@ -1729,9 +1806,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # play_media startet selbst. Nach kurzem Settle explizit entstummen;
             # der alte zusätzliche media_play-Impuls war Teil des Lock-Races.
             self._set_playback_recovery("settling", health="settling")
-            if not await self._recovery_sleep(
-                2.0, require_positive_target=require_positive_target
-            ):
+            if not await self._recovery_sleep(2.0, require_positive_target=False):
                 return
             if await self._wait_for_playing_homepods():
                 await self._unmute_homepods(
@@ -1754,7 +1829,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             elapsed = self.hass.loop.time() - (self._playback_recovery_started_at or 0.0)
             if not await self._recovery_sleep(
                 max(0.0, settle - elapsed),
-                require_positive_target=require_positive_target,
+                require_positive_target=False,
             ):
                 return
             health = await self._stable_playback_health()
@@ -1797,17 +1872,14 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if is_resume and not dispatched:
                 self._set_playback_recovery("failed", health="unhealthy", reason=self._radio_dispatch_state.last_error or "recovery_dispatch_blocked")
                 return
-            if not await self._recovery_sleep(
-                2.0, require_positive_target=require_positive_target
-            ):
+            if not await self._recovery_sleep(2.0, require_positive_target=False):
                 return
             if await self._wait_for_playing_homepods():
                 await self._unmute_homepods(
                     source=f"{source}_soft_recovery", force_all=True
                 )
             if not await self._recovery_sleep(
-                DEFAULT_PLAYBACK_RECOVERY_RECHECK,
-                require_positive_target=require_positive_target,
+                DEFAULT_PLAYBACK_RECOVERY_RECHECK, require_positive_target=False
             ):
                 return
             health = await self._stable_playback_health()
@@ -2006,6 +2078,15 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._radio_dispatch_result(success=False, error=ValueError(invalid))
             return False
         inp = self._build_inputs()
+        episode_start_block = (
+            self._playback_start_block_reason(
+                inp,
+                source=self._playback_recovery_source or source,
+                admission=False,
+            )
+            if self._wake_start_owned and not replace_existing
+            else None
+        )
         recovery_block = (
             self._playback_repair_block_reason(
                 inp,
@@ -2016,7 +2097,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else None
         )
         if (
-            recovery_block is not None
+            episode_start_block is not None
+            or recovery_block is not None
             or inp.stop_latch
             or inp.radio_ready is False
             or (inp.manual_playback is True and not replace_existing)
