@@ -61,8 +61,12 @@ def runtime(monkeypatch):
     env.inputs = L.Inputs(apply_enabled=True, volume_apply_allowed=True, action=C.ACTION_RESUME, homepods_should_pause=False, homepods_resume_allowed=True, homepods_target=0.3, quiet_mode=False, presence_state="anwesend", away_gate=False, stop_latch=False, radio_ready=True, manual_playback=False, planned_station_playing=False, bio_sleep=False, bio_state="awake", tv_power_on=False, audio_owner="homepods", radio_station="gayfm")
     group = "media_player.group"
     pods = ["media_player.pod1", "media_player.pod2"]
+    env.bio_entity = "sensor.bio_state"
+    env.latch_entity = "input_boolean.media_stop_latch"
     for entity in [group, *pods]:
         env.states[entity] = types.SimpleNamespace(state="idle", attributes={"is_volume_muted": False, "supported_features": 8})
+    env.states[env.bio_entity] = types.SimpleNamespace(state="awake", attributes={})
+    env.states[env.latch_entity] = types.SimpleNamespace(state="off", attributes={})
 
     async def service(domain, action, data, **kwargs):
         env.calls.append((domain, action, data))
@@ -71,8 +75,8 @@ def runtime(monkeypatch):
         if domain == "media_player" and action == "media_play":
             env.media_play_count += 1
             if env.resume_plays_at is not None and env.media_play_count >= env.resume_plays_at:
-                for state in env.states.values():
-                    state.state = "playing"
+                for entity in [group, *pods]:
+                    env.states[entity].state = "playing"
                 env.inputs = replace(
                     env.inputs,
                     homepods_resume_allowed=False,
@@ -84,17 +88,20 @@ def runtime(monkeypatch):
             if env.provider_error:
                 raise ValueError("private-url?token=must-not-appear")
             if env.replace_plays:
-                for state in env.states.values():
-                    state.state = "playing"
+                for entity in [group, *pods]:
+                    env.states[entity].state = "playing"
                 env.states[group].attributes["media_content_id"] = data["media_id"]
                 env.states[group].attributes["media_content_type"] = data["media_type"]
                 env.inputs = replace(env.inputs, homepods_resume_allowed=False, action=C.ACTION_NONE, planned_station_playing=True, audio_owner="homepods")
         if action == "volume_mute":
             for entity in data["entity_id"]:
                 env.states[entity].attributes["is_volume_muted"] = False
+        if domain == "homeassistant" and action == "turn_off" and data["entity_id"] == env.latch_entity:
+            env.states[env.latch_entity].state = "off"
+            env.inputs = replace(env.inputs, stop_latch=False)
 
     hass = types.SimpleNamespace(states=types.SimpleNamespace(get=env.states.get), services=types.SimpleNamespace(async_call=service), loop=types.SimpleNamespace(time=lambda: env.now), async_create_task=asyncio.create_task)
-    options = {C.CONF_APPLY_ENABLED: True, C.CONF_HOMEPODS_PLAYER: group, C.CONF_HOMEPODS_PODS: pods}
+    options = {C.CONF_APPLY_ENABLED: True, C.CONF_HOMEPODS_PLAYER: group, C.CONF_HOMEPODS_PODS: pods, C.CONF_BIO_STATE: env.bio_entity, C.CONF_STOP_LATCH: env.latch_entity}
     entry = types.SimpleNamespace(data={}, options=options, entry_id="test")
     coord = module.MediaApplyCoordinator(hass, entry)
     monkeypatch.setattr(coord, "_build_inputs", lambda: env.inputs)
@@ -110,6 +117,235 @@ def runtime(monkeypatch):
     monkeypatch.setattr(module.asyncio, "sleep", sleep)
     env.coord = coord
     return env
+
+
+def set_bio_latch(runtime, *, previous, current, latch=True, **changes):
+    runtime.coord._last_bio_state = previous
+    runtime.states[runtime.bio_entity].state = current
+    runtime.states[runtime.latch_entity].state = "on" if latch else "off"
+    runtime.inputs = replace(
+        runtime.inputs,
+        bio_state=current,
+        bio_sleep=current == "sleep",
+        stop_latch=latch,
+        **changes,
+    )
+
+
+async def settle_edge_tasks(runtime):
+    await asyncio.sleep(0)
+    tasks = [
+        task
+        for task in (
+            runtime.coord._wake_task,
+            runtime.coord._playback_recovery_task,
+        )
+        if task is not None and not task.done()
+    ]
+    if tasks:
+        await asyncio.gather(*tasks)
+    await asyncio.sleep(0)
+
+
+def test_stop_latch_sleep_to_waking_resets_once_and_wake_becomes_healthy(runtime):
+    set_bio_latch(
+        runtime,
+        previous="sleep",
+        current="waking",
+        audio_owner="none",
+        action=C.ACTION_NONE,
+    )
+
+    async def run():
+        runtime.coord._compute()
+        await settle_edge_tasks(runtime)
+
+    asyncio.run(run())
+    clears = [
+        call
+        for call in runtime.calls
+        if call[:2] == ("homeassistant", "turn_off")
+    ]
+    assert len(clears) == 1
+    assert sum(domain == "music_assistant" for domain, _, _ in runtime.calls) == 1
+    assert runtime.coord._playback_health == "healthy"
+    assert runtime.coord.status()["wake"]["stop_latch_reset_reason"] == "bio_wake_edge"
+
+
+def test_stop_latch_sleep_to_awake_resets_when_waking_is_skipped(runtime):
+    set_bio_latch(
+        runtime,
+        previous="sleep",
+        current="awake",
+        action=C.ACTION_NONE,
+        away_gate=True,
+    )
+
+    async def run():
+        runtime.coord._compute()
+        await settle_edge_tasks(runtime)
+
+    asyncio.run(run())
+    assert [
+        call for call in runtime.calls if call[:2] == ("homeassistant", "turn_off")
+    ] == [
+        (
+            "homeassistant",
+            "turn_off",
+            {"entity_id": runtime.latch_entity},
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"away_gate": True},
+        {"audio_owner": "tv_denon", "tv_power_on": True},
+    ],
+)
+def test_bio_wake_edge_resets_latch_even_when_start_is_blocked(runtime, block):
+    set_bio_latch(
+        runtime,
+        previous="provisional_sleep",
+        current="waking",
+        action=C.ACTION_NONE,
+        **block,
+    )
+
+    async def run():
+        runtime.coord._compute()
+        await settle_edge_tasks(runtime)
+
+    asyncio.run(run())
+    assert sum(action == "turn_off" for _, action, _ in runtime.calls) == 1
+    assert not any(domain == "music_assistant" for domain, _, _ in runtime.calls)
+
+
+@pytest.mark.parametrize(
+    ("previous", "current"),
+    [("awake", "awake"), (None, "waking")],
+)
+def test_no_stop_latch_reset_without_known_sleep_to_wake_edge(
+    runtime, previous, current
+):
+    set_bio_latch(
+        runtime,
+        previous=previous,
+        current=current,
+        action=C.ACTION_NONE,
+        away_gate=True,
+    )
+
+    async def run():
+        runtime.coord._compute()
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert not any(action == "turn_off" for _, action, _ in runtime.calls)
+    assert runtime.states[runtime.latch_entity].state == "on"
+
+
+def test_shadow_consumes_bio_wake_edge_without_resetting_latch(runtime):
+    runtime.coord.entry.options[C.CONF_APPLY_ENABLED] = False
+    set_bio_latch(
+        runtime,
+        previous="sleep",
+        current="waking",
+        action=C.ACTION_NONE,
+    )
+
+    async def run():
+        runtime.coord._compute()
+        await asyncio.sleep(0)
+        runtime.coord.entry.options[C.CONF_APPLY_ENABLED] = True
+        runtime.coord._compute()
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert not any(action == "turn_off" for _, action, _ in runtime.calls)
+    assert runtime.states[runtime.latch_entity].state == "on"
+
+
+@pytest.mark.parametrize("source", ["policy", "tv_resume", "resume", "retry"])
+def test_stop_latch_remains_hard_gate_for_non_wake_sources(runtime, source):
+    runtime.inputs = replace(runtime.inputs, stop_latch=True)
+    runtime.states[runtime.latch_entity].state = "on"
+
+    async def run():
+        if source == "policy":
+            await runtime.coord._execute(
+                L.ApplyPlan(homepods_action=C.ACTION_START_RADIO, execute=True)
+            )
+        elif source in ("tv_resume", "resume"):
+            runtime.coord._schedule_resume_reconciliation(source=source)
+            if runtime.coord._playback_recovery_task is not None:
+                await runtime.coord._playback_recovery_task
+        else:
+            runtime.coord._wake_start_owned = True
+            runtime.coord._playback_episode_admitted = True
+            runtime.coord._playback_recovery_source = "resume"
+            await runtime.coord._dispatch_automatic_radio(
+                L.resolve_radio_uri("gayfm"),
+                source="resume_retry",
+                replace_existing=True,
+            )
+
+    asyncio.run(run())
+    assert runtime.states[runtime.latch_entity].state == "on"
+    assert not any(
+        action in ("media_play", "play_media", "turn_off")
+        for _, action, _ in runtime.calls
+    )
+
+
+def test_wake_admission_ignores_existing_stop_latch_only_once(runtime):
+    runtime.inputs = replace(runtime.inputs, stop_latch=True)
+
+    assert (
+        runtime.coord._playback_start_block_reason(
+            runtime.inputs,
+            source="wake",
+            admission=True,
+        )
+        is None
+    )
+    assert (
+        runtime.coord._playback_start_block_reason(
+            runtime.inputs,
+            source="wake",
+            admission=False,
+        )
+        == "stop_latch"
+    )
+
+
+def test_new_stop_during_running_wake_episode_cancels(runtime):
+    runtime.inputs = replace(
+        runtime.inputs,
+        action=C.ACTION_NONE,
+        audio_owner="none",
+    )
+
+    def stop_after_dispatch():
+        if runtime.states["media_player.group"].state != "playing":
+            return
+        runtime.inputs = replace(runtime.inputs, stop_latch=True)
+        runtime.states[runtime.latch_entity].state = "on"
+        runtime.coord._compute()
+        runtime.on_wait = None
+
+    runtime.on_wait = stop_after_dispatch
+
+    async def run():
+        runtime.coord._schedule_radio_autostart()
+        await runtime.coord._playback_recovery_task
+
+    asyncio.run(run())
+    assert runtime.coord._playback_recovery_stage == "cancelled"
+    assert runtime.coord._playback_health_reason == "stop_latch"
+    assert runtime.states[runtime.latch_entity].state == "on"
+    assert not any(action == "turn_off" for _, action, _ in runtime.calls)
 
 
 def run_action(env, action):
@@ -394,8 +630,8 @@ def test_wake_cannot_replace_an_owned_resume_task(runtime):
 
 
 def test_wake_single_flight_and_unmute_survive_falling_resume_permission(runtime):
-    for state in runtime.states.values():
-        state.attributes["is_volume_muted"] = True
+    for entity in ("media_player.group", "media_player.pod1", "media_player.pod2"):
+        runtime.states[entity].attributes["is_volume_muted"] = True
 
     async def run():
         runtime.coord._schedule_radio_autostart()
@@ -405,7 +641,10 @@ def test_wake_single_flight_and_unmute_survive_falling_resume_permission(runtime
     assert sum(d == "music_assistant" for d, _, _ in runtime.calls) == 1
     assert not any(a == "media_play" for _, a, _ in runtime.calls)
     assert runtime.inputs.homepods_resume_allowed is False
-    assert all(state.attributes["is_volume_muted"] is False for state in runtime.states.values() if state is not runtime.states["media_player.group"])
+    assert all(
+        runtime.states[entity].attributes["is_volume_muted"] is False
+        for entity in ("media_player.pod1", "media_player.pod2")
+    )
     assert runtime.coord._playback_health == "healthy"
 
 

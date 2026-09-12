@@ -211,6 +211,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._wake_task: Optional[asyncio.Task] = None
         self._last_wake_states: dict[str, bool] = {}
         self._last_bio_state: str | None = None
+        self._last_stop_latch_reset_reason: str | None = None
+        self._last_stop_latch_reset_at: str | None = None
         self._radio_resume_task: Optional[asyncio.Task] = None
         self._radio_dispatch_state = logic.RadioDispatchState()
         self._radio_dispatch_payload: dict[str, Any] = {}
@@ -610,7 +612,12 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             inputs, self._nachlauf_state
         )
         twol, self._tv_wol_state = logic.decide_tv_wol(inputs, self._tv_wol_state)
+        previous_bio_state = self._last_bio_state
         bio_to_awake, _ = self._bio_edges()   # sleep-Edge nur noch für media_state relevant
+        self._schedule_stop_latch_reset(
+            previous_bio_state in BIO_SLEEP_CONTEXT_VALUES and bio_to_awake,
+            inputs,
+        )
         edge_inp = replace(
             inputs,
             sleep_tv_extend_pressed=self._consume_extend_edge(),
@@ -687,7 +694,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         manual_off = self._manual_off_edge()
         if self.apply_enabled and self._radio_autostart_enabled and not media_blocked:
             if wake_radio_start:
-                # Trigger A: Wake → Latch lösen + geplante Station starten.
+                # Trigger A: Wake → geplante Station starten. Der Latch-Reset gehört
+                # unabhängig davon ausschließlich der Bio-Wachflanke.
                 self._schedule_radio_autostart()
             elif (
                 not self._wake_start_owned
@@ -1009,6 +1017,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "start_volume": s.wake_start_volume,
                 "debounce_s": s.wake_debounce_seconds,
                 "bio_sleep": inp.bio_sleep,
+                "stop_latch_reset_reason": self._last_stop_latch_reset_reason,
+                "stop_latch_reset_at": self._last_stop_latch_reset_at,
             },
             "playback_recovery": {
                 "running": (
@@ -1321,6 +1331,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             gate_inp = replace(gate_inp, audio_owner="homepods")
         if not admission or source == "policy":
             gate_inp = replace(gate_inp, homepods_resume_allowed=True)
+        if admission and source == "wake":
+            gate_inp = replace(gate_inp, stop_latch=False)
         reason = logic.playback_start_block_reason(
             gate_inp, require_positive_target=False
         )
@@ -1741,11 +1753,6 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Single-flight Wake-Start with soft and optional hard recovery (#41)."""
         self._playback_recovery_source = source
         is_resume = source != "wake"
-        latch = self._entity_id(CONF_STOP_LATCH)
-        if latch and not is_resume:
-            await self._svc(
-                "homeassistant", "turn_off", {"entity_id": latch}, blocking=True
-            )
         # Race-Fix: Auf derselben Wake-Flanke setzt _run_wake parallel den
         # Volume-Floor (0.10, blockierend). Kurzer Vorlauf, damit der Floor anliegt,
         # bevor wir Ton ausgeben — sonst Burst bei alter Lautstärke (FLEET-42).
@@ -2202,6 +2209,30 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         _LOGGER.info("media_apply: R12 wake dispatched for screen episode %s", episode_id)
 
     # ----- Wake-Sequenz (R23) + bio-Flanken -----
+    def _schedule_stop_latch_reset(
+        self, bio_wake_edge: bool, inp: logic.Inputs
+    ) -> None:
+        """Clear the shared stop latch once on a known sleep-to-wake edge."""
+        latch = self._entity_id(CONF_STOP_LATCH)
+        if not (
+            bio_wake_edge
+            and self.apply_enabled
+            and inp.stop_latch
+            and latch
+        ):
+            return
+        self._last_stop_latch_reset_reason = "bio_wake_edge"
+        self._last_stop_latch_reset_at = dt_util.utcnow().isoformat()
+        _LOGGER.info("media_apply: stop latch reset (bio_wake_edge)")
+        self.hass.async_create_task(
+            self._svc(
+                "homeassistant",
+                "turn_off",
+                {"entity_id": latch},
+                blocking=True,
+            )
+        )
+
     def _bio_edges(self) -> tuple[bool, bool]:
         """bio_state-Flanken (to_awake, to_sleep) aus core_state. EINMAL pro Tick
         (mutiert Vortick-State); Erststand zählt nicht. to_awake = Eintritt in
