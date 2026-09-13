@@ -465,8 +465,13 @@ def test_policy_start_radio_owner_none_starts_once(runtime):
     assert runtime.coord._playback_health == "healthy"
 
 
-def test_wake_episode_ignores_resume_allowed_after_dispatch(runtime):
-    runtime.inputs = replace(runtime.inputs, audio_owner="none")
+def test_wake_admission_and_episode_ignore_resume_allowed(runtime):
+    runtime.inputs = replace(
+        runtime.inputs,
+        action=C.ACTION_NONE,
+        audio_owner="none",
+        homepods_resume_allowed=False,
+    )
     def check_after_start():
         runtime.coord._compute()
         runtime.on_wait = None
@@ -480,8 +485,231 @@ def test_wake_episode_ignores_resume_allowed_after_dispatch(runtime):
             await task
 
     asyncio.run(run())
+    assert sum(domain == "music_assistant" for domain, _, _ in runtime.calls) == 1
     assert runtime.coord._playback_health == "healthy"
     assert runtime.inputs.homepods_resume_allowed is False
+
+
+def test_live_wake_policy_and_quiet_sequence_has_one_start(runtime):
+    runtime.inputs = replace(
+        runtime.inputs,
+        action=C.ACTION_NONE,
+        audio_owner="none",
+        homepods_resume_allowed=False,
+    )
+    policy_arrived = False
+    quiet_ended = False
+
+    def advance_live_sequence():
+        nonlocal policy_arrived, quiet_ended
+        if not policy_arrived:
+            policy_arrived = True
+            runtime.inputs = replace(
+                runtime.inputs,
+                action=C.ACTION_START_RADIO,
+                quiet_mode=True,
+            )
+            runtime.coord._compute()
+        elif not quiet_ended and runtime.now >= 5.0:
+            quiet_ended = True
+            runtime.inputs = replace(runtime.inputs, quiet_mode=False)
+            runtime.coord._compute()
+
+    runtime.on_wait = advance_live_sequence
+
+    async def run():
+        runtime.coord._schedule_radio_autostart()
+        task = runtime.coord._playback_recovery_task
+        assert task is not None
+        await task
+
+    asyncio.run(run())
+    assert policy_arrived is True
+    assert quiet_ended is True
+    assert sum(domain == "music_assistant" for domain, _, _ in runtime.calls) == 1
+    assert runtime.coord._playback_health == "healthy"
+
+
+@pytest.mark.parametrize(("group_state", "seen_playing"), [("idle", False), ("playing", True)])
+def test_quiet_does_not_end_owned_start_episode(runtime, group_state, seen_playing):
+    runtime.inputs = replace(
+        runtime.inputs,
+        action=C.ACTION_NONE,
+        quiet_mode=True,
+        homepods_resume_allowed=False,
+    )
+    runtime.states["media_player.group"].state = group_state
+    runtime.coord._wake_start_owned = True
+    runtime.coord._playback_episode_admitted = True
+    runtime.coord._playback_episode_seen_playing = seen_playing
+    runtime.coord._playback_recovery_source = "wake"
+    runtime.coord._playback_recovery_stage = "initial_start"
+
+    async def run():
+        runtime.coord._compute()
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert runtime.coord._wake_start_owned is True
+    assert runtime.coord._playback_recovery_stage == "initial_start"
+
+
+@pytest.mark.parametrize(
+    ("blocked", "cleared"),
+    [
+        ({"homepods_resume_allowed": False}, {"homepods_resume_allowed": True}),
+        ({"volume_apply_allowed": False}, {"volume_apply_allowed": True}),
+        ({"presence_state": "unknown"}, {"presence_state": "anwesend"}),
+        ({"radio_ready": False}, {"radio_ready": True}),
+        ({"audio_owner": "unknown"}, {"audio_owner": "homepods"}),
+    ],
+)
+def test_policy_readmission_once_per_transient_blocker_clearance(
+    runtime, monkeypatch, blocked, cleared
+):
+    attempts = []
+
+    def schedule(*, source, readmission=False):
+        attempts.append((source, readmission, runtime.now))
+        runtime.coord._policy_readmission_blocker = None
+        runtime.coord._policy_readmission_last_attempt_at = runtime.now
+
+    monkeypatch.setattr(runtime.coord, "_schedule_resume_reconciliation", schedule)
+    runtime.inputs = replace(
+        runtime.inputs,
+        action=C.ACTION_START_RADIO,
+        **blocked,
+    )
+    runtime.coord._maybe_schedule_policy_readmission(runtime.inputs)
+    runtime.inputs = replace(runtime.inputs, **cleared)
+    runtime.coord._maybe_schedule_policy_readmission(runtime.inputs)
+    runtime.coord._maybe_schedule_policy_readmission(runtime.inputs)
+
+    assert attempts == [("policy", True, 1.0)]
+
+
+def test_state_change_rechecks_persistent_policy_after_presence_hold(runtime):
+    runtime.inputs = replace(
+        runtime.inputs,
+        action=C.ACTION_START_RADIO,
+        presence_state="unknown",
+    )
+
+    async def run():
+        runtime.coord._on_state_change(None)
+        assert runtime.coord._policy_readmission_blocker == "presence_unknown"
+        runtime.inputs = replace(runtime.inputs, presence_state="anwesend")
+        runtime.coord._on_state_change(None)
+        task = runtime.coord._playback_recovery_task
+        assert task is not None
+        await task
+
+    asyncio.run(run())
+    assert sum(domain == "music_assistant" for domain, _, _ in runtime.calls) == 1
+    assert runtime.coord._playback_health == "healthy"
+
+
+def test_policy_readmission_keeps_thirty_second_attempt_distance(runtime, monkeypatch):
+    attempts = []
+
+    def schedule(*, source, readmission=False):
+        attempts.append((source, readmission, runtime.now))
+        runtime.coord._policy_readmission_blocker = None
+        runtime.coord._policy_readmission_last_attempt_at = runtime.now
+
+    monkeypatch.setattr(runtime.coord, "_schedule_resume_reconciliation", schedule)
+    runtime.inputs = replace(
+        runtime.inputs,
+        action=C.ACTION_START_RADIO,
+        presence_state="unknown",
+    )
+    runtime.coord._maybe_schedule_policy_readmission(runtime.inputs)
+    runtime.inputs = replace(runtime.inputs, presence_state="anwesend")
+    runtime.coord._maybe_schedule_policy_readmission(runtime.inputs)
+    runtime.inputs = replace(runtime.inputs, radio_ready=False)
+    runtime.coord._maybe_schedule_policy_readmission(runtime.inputs)
+    runtime.now = 30.9
+    runtime.inputs = replace(runtime.inputs, radio_ready=True)
+    runtime.coord._maybe_schedule_policy_readmission(runtime.inputs)
+    runtime.now = 31.0
+    runtime.coord._maybe_schedule_policy_readmission(runtime.inputs)
+
+    assert attempts == [("policy", True, 1.0), ("policy", True, 31.0)]
+
+
+@pytest.mark.parametrize(
+    "hard_block",
+    [
+        {"stop_latch": True},
+        {"away_gate": True},
+        {"bio_sleep": True, "bio_state": "sleep"},
+        {"bio_sleep": False, "bio_state": "provisional_sleep"},
+        {"homepods_should_pause": True},
+        {"audio_owner": "tv_denon", "tv_power_on": True},
+        {"manual_playback": True},
+    ],
+)
+def test_policy_readmission_never_rearms_from_hard_blocker(
+    runtime, monkeypatch, hard_block
+):
+    attempts = []
+    monkeypatch.setattr(
+        runtime.coord,
+        "_schedule_resume_reconciliation",
+        lambda **kwargs: attempts.append(kwargs),
+    )
+    runtime.inputs = replace(
+        runtime.inputs,
+        action=C.ACTION_START_RADIO,
+        presence_state="unknown",
+    )
+    runtime.coord._maybe_schedule_policy_readmission(runtime.inputs)
+    runtime.inputs = replace(
+        runtime.inputs,
+        presence_state="anwesend",
+        **hard_block,
+    )
+    runtime.coord._maybe_schedule_policy_readmission(runtime.inputs)
+    cleared = {
+        key: (
+            "awake"
+            if key == "bio_state"
+            else "homepods"
+            if key == "audio_owner"
+            else False
+        )
+        for key in hard_block
+    }
+    runtime.inputs = replace(runtime.inputs, **cleared)
+    runtime.coord._maybe_schedule_policy_readmission(runtime.inputs)
+
+    assert attempts == []
+
+
+def test_policy_readmission_does_not_restart_failed_or_user_stopped_episode(
+    runtime, monkeypatch
+):
+    attempts = []
+    monkeypatch.setattr(
+        runtime.coord,
+        "_schedule_resume_reconciliation",
+        lambda **kwargs: attempts.append(kwargs),
+    )
+    runtime.inputs = replace(
+        runtime.inputs,
+        action=C.ACTION_START_RADIO,
+        presence_state="unknown",
+    )
+    runtime.coord._maybe_schedule_policy_readmission(runtime.inputs)
+    runtime.inputs = replace(runtime.inputs, presence_state="anwesend")
+    runtime.coord._playback_recovery_stage = "failed"
+    runtime.coord._maybe_schedule_policy_readmission(runtime.inputs)
+    runtime.coord._playback_recovery_stage = "cancelled"
+    runtime.coord._playback_health_reason = "resume_user_stopped"
+    runtime.coord._policy_readmission_blocker = None
+    runtime.coord._maybe_schedule_policy_readmission(runtime.inputs)
+
+    assert attempts == []
 
 
 def test_manual_end_trigger_b_starts_with_owner_none(runtime):
