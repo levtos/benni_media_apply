@@ -889,15 +889,18 @@ def test_sleep_tv_cancel_when_sleep_ends():
     assert ns.armed is False
 
 
-def test_sleep_tv_cancel_when_tv_off():
+def test_sleep_tv_keeps_deadline_while_tv_off_is_not_yet_confirmed():
     s = L.SleepTvState(
         armed=True, deadline=2800.0, last_bio_state="provisional_sleep", last_tv_on=True
     )
     p, ns = L.decide_sleep_tv(
         _stv(bio_state="provisional_sleep", tv_power_on=False), s, now=200.0
     )
-    assert p.intent == L.TIMER_CANCEL
-    assert ns.armed is False
+    assert p.intent == L.TIMER_NONE
+    assert ns.armed is True
+    assert ns.deadline == 2800.0
+    assert ns.off_confirmed_since == 200.0
+    assert p.evidence == "confirming_off"
 
 
 def test_manual_sleep_during_ps_resets_deadline_to_now_plus_45_minutes():
@@ -935,20 +938,143 @@ def test_tv_activation_during_sleep_starts_new_full_timer_without_wake(bio_state
 
 
 def test_tv_off_requires_ten_continuous_confirmed_minutes():
-    first = L.SleepTvState(last_bio_state="provisional_sleep", last_tv_on=True)
+    first = L.SleepTvState(
+        armed=True,
+        deadline=3700.0,
+        timer_source="sleep_context_entry",
+        last_bio_state="provisional_sleep",
+        last_tv_on=True,
+        off_commanded_for_deadline=3700.0,
+        warned_for_deadline=3700.0,
+    )
     p, state = L.decide_sleep_tv(
         _stv(bio_state="provisional_sleep", tv_power_on=False), first, now=1000.0
     )
+    assert p.intent == L.TIMER_NONE
     assert p.evidence == "confirming_off"
+    assert state.deadline == 3700.0
+    assert state.off_commanded_for_deadline == 3700.0
+    assert state.warned_for_deadline == 3700.0
     p, state = L.decide_sleep_tv(
         _stv(bio_state="provisional_sleep", tv_power_on=False), state, now=1599.0
     )
+    assert p.intent == L.TIMER_NONE
     assert p.evidence == "confirming_off"
+    assert state.deadline == 3700.0
     p, state = L.decide_sleep_tv(
         _stv(bio_state="provisional_sleep", tv_power_on=False), state, now=1600.0
     )
+    assert p.intent == L.TIMER_CANCEL
     assert p.evidence == "off_confirmed"
     assert state.off_confirmed_at == 1600.0
+    assert state.armed is False
+    assert state.deadline is None
+    assert state.off_commanded_for_deadline is None
+    assert state.warned_for_deadline is None
+
+
+def test_tv_returns_during_off_confirmation_keeps_existing_deadline():
+    state = L.SleepTvState(
+        armed=True,
+        deadline=3700.0,
+        timer_source="manual_sleep_reset",
+        last_bio_state="sleep",
+        last_tv_on=False,
+        off_confirmed_since=1000.0,
+    )
+
+    plan, state = L.decide_sleep_tv(
+        _stv(bio_state="sleep", sleep_source="manual", tv_power_on=True),
+        state,
+        now=1300.0,
+    )
+
+    assert plan.intent == L.TIMER_NONE
+    assert state.armed is True
+    assert state.deadline == 3700.0
+    assert state.timer_source == "manual_sleep_reset"
+    assert state.off_confirmed_since is None
+    assert state.off_confirmed_at is None
+    assert plan.evidence == "tv_active"
+
+
+def test_tv_returns_during_off_confirmation_without_deadline_starts_timer():
+    state = L.SleepTvState(
+        last_bio_state="provisional_sleep",
+        last_tv_on=False,
+        off_confirmed_since=1000.0,
+    )
+
+    plan, state = L.decide_sleep_tv(
+        _stv(bio_state="provisional_sleep", tv_power_on=True), state, now=1300.0
+    )
+
+    assert plan.intent == L.TIMER_ARM
+    assert state.deadline == 4000.0
+    assert state.timer_source == "tv_activation"
+
+
+def test_live_flaps_keep_manual_deadline_at_04_32_35():
+    state = L.SleepTvState(
+        armed=True,
+        deadline=15000.0,
+        timer_source="sleep_context_entry",
+        last_bio_state="provisional_sleep",
+        last_tv_on=True,
+    )
+    plan, state = L.decide_sleep_tv(
+        _stv(bio_state="sleep", sleep_source="manual", tv_power_on=True),
+        state,
+        now=13655.0,  # 03:47:35
+    )
+    assert plan.intent == L.TIMER_ARM
+    assert state.deadline == 16355.0  # 04:32:35
+
+    for off_at, on_at in (
+        (13852.0, 13855.0),  # 03:50:52 -> 03:50:55
+        (14726.0, 14730.0),  # 04:05:26 -> 04:05:30
+        (14733.0, 14779.0),  # 04:05:33 -> 04:06:19
+    ):
+        plan, state = L.decide_sleep_tv(
+            _stv(bio_state="sleep", sleep_source="manual", tv_power_on=False),
+            state,
+            now=off_at,
+        )
+        assert plan.intent == L.TIMER_NONE
+        assert state.deadline == 16355.0
+        plan, state = L.decide_sleep_tv(
+            _stv(bio_state="sleep", sleep_source="manual", tv_power_on=True),
+            state,
+            now=on_at,
+        )
+        assert plan.intent == L.TIMER_NONE
+        assert state.deadline == 16355.0
+
+    plan, state = L.decide_sleep_tv(
+        _stv(bio_state="sleep", sleep_source="manual", tv_power_on=True),
+        state,
+        now=16355.0,
+    )
+    assert plan.intent == L.TIMER_NONE
+    assert state.armed is True
+    assert state.deadline == 16355.0
+
+
+def test_tv_activation_after_confirmed_off_starts_new_full_timer():
+    state = L.SleepTvState(
+        last_bio_state="sleep",
+        last_tv_on=False,
+        off_confirmed_since=1000.0,
+        off_confirmed_at=1600.0,
+    )
+
+    plan, state = L.decide_sleep_tv(
+        _stv(bio_state="sleep", tv_power_on=True), state, now=2000.0
+    )
+
+    assert plan.intent == L.TIMER_ARM
+    assert state.deadline == 4700.0
+    assert state.timer_source == "tv_activation"
 
 
 def test_unknown_tv_breaks_off_confirmation_and_never_counts_as_off():
@@ -983,7 +1109,7 @@ def test_sleep_tv_state_roundtrip_preserves_restart_deadlines():
     assert L.SleepTvState.from_dict(state.as_dict()) == state
 
 
-def test_manual_sleep_with_tv_off_keeps_tv_off_without_timer():
+def test_manual_sleep_with_tv_off_keeps_existing_timer_until_confirmed():
     state = L.SleepTvState(
         armed=True,
         deadline=1300.0,
@@ -995,9 +1121,9 @@ def test_manual_sleep_with_tv_off_keeps_tv_off_without_timer():
         state,
         now=1000.0,
     )
-    assert plan.intent == L.TIMER_CANCEL
-    assert new_state.armed is False
-    assert new_state.deadline is None
+    assert plan.intent == L.TIMER_NONE
+    assert new_state.armed is True
+    assert new_state.deadline == 1300.0
     assert plan.evidence == "confirming_off"
 
 

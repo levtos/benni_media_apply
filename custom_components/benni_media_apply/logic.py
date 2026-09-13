@@ -1500,7 +1500,12 @@ def decide_sleep_tv(
         ns.off_commanded_for_deadline = None
         ns.warned_for_deadline = None
     elif tv_off is False:
-        tv_activated = ns.last_tv_on is False
+        interrupted_off_confirmation = (
+            ns.off_confirmed_since is not None and ns.off_confirmed_at is None
+        )
+        tv_activated = ns.last_tv_on is False and (
+            not interrupted_off_confirmation or ns.deadline is None
+        )
         ns.off_confirmed_since = None
         ns.off_confirmed_at = None
         if manual_ps_to_s:
@@ -1534,20 +1539,20 @@ def decide_sleep_tv(
         ns.sleep_reference_start = inp.sleep_reference_start
         p.evidence = "tv_active"
     elif tv_off is True:
-        if ns.armed or ns.deadline is not None:
-            p.intent = TIMER_CANCEL
-            reasons.append("issue59:verified_tv_off")
-        ns.armed = False
-        ns.deadline = None
-        ns.timer_source = None
-        ns.off_commanded_for_deadline = None
-        ns.warned_for_deadline = None
         if ns.last_tv_on is not False or ns.off_confirmed_since is None:
             ns.off_confirmed_since = now
             ns.off_confirmed_at = None
             reasons.append("issue59:off_confirmation_started")
         if now - ns.off_confirmed_since >= max(0.0, confirm_s):
             ns.off_confirmed_at = ns.off_confirmed_since + max(0.0, confirm_s)
+            if ns.armed or ns.deadline is not None:
+                p.intent = TIMER_CANCEL
+                reasons.append("issue59:verified_tv_off")
+            ns.armed = False
+            ns.deadline = None
+            ns.timer_source = None
+            ns.off_commanded_for_deadline = None
+            ns.warned_for_deadline = None
             p.evidence = "off_confirmed"
         else:
             p.evidence = "confirming_off"

@@ -184,6 +184,11 @@ def test_real_sleep_off_consumes_before_service(runtime, monkeypatch, bio):  # n
     monkeypatch.setattr(coord, "_compute", lambda: {})
     asyncio.run(coord._run_sleep_tv(1.0))
     assert [action for _, action, _ in runtime.calls] == ["turn_off"]
+    runtime.inputs = replace(
+        runtime.inputs, tv_player_state="on", tv_power_on=True
+    )
+    asyncio.run(coord._run_sleep_tv(1.0))
+    assert [action for _, action, _ in runtime.calls] == ["turn_off"]
 
 
 @pytest.mark.parametrize("shadow", [False, True])
