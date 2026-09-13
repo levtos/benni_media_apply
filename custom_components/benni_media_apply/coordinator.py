@@ -159,6 +159,16 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 _TRUE = frozenset({"on", "true", "1", "home", "active", "playing", "open"})
+_POLICY_READMISSION_COOLDOWN = 30.0
+_POLICY_READMISSION_TRANSIENT_BLOCKERS = frozenset(
+    {
+        "resume_not_allowed",
+        "volume_apply_not_allowed",
+        "presence_unknown",
+        "radio_not_ready",
+        "audio_owner_unproven",
+    }
+)
 
 
 def _bool(s: str | None) -> bool:
@@ -241,6 +251,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._playback_recovery_attempts = 0
         self._playback_recovery_started_at: float | None = None
         self._last_hard_recovery_at: float | None = None
+        self._policy_readmission_blocker: str | None = None
+        self._policy_readmission_last_attempt_at: float | None = None
         self._last_manual_playback: bool | None = None
         self._nachlauf_tasks: dict[str, asyncio.Task] = {}
         self._last_debug: dict[str, Any] = {}
@@ -647,6 +659,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._playback_health_reason = None
             self._playback_recovery_stage = "initial_start"
             self._playback_recovery_attempts = 0
+        self._maybe_schedule_policy_readmission(inputs)
         # Music Assistant play_media ist der einzige Start-Owner der Wake-Episode.
         # Policy-resume/start_radio darf währenddessen weder davor noch nach einem
         # AirPlay-State-Flap einen parallelen Startimpuls erzeugen.
@@ -1224,11 +1237,17 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     @callback
-    def _schedule_resume_reconciliation(self, *, source: str) -> None:
+    def _schedule_resume_reconciliation(
+        self, *, source: str, readmission: bool = False
+    ) -> None:
         """Claim the existing single flight before any resume/replace side effect."""
         inp = self._build_inputs()
-        if self._wake_start_owned or self._resume_episode_finished:
+        if self._wake_start_owned or (
+            self._resume_episode_finished and not readmission
+        ):
             return
+        if readmission:
+            self._resume_episode_finished = False
         if source == "tv_resume" and self._resume_content_changed_since_pause():
             self._resume_episode_finished = True
             self._set_playback_recovery(
@@ -1254,6 +1273,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._resume_episode_dispatched = False
         self._playback_recovery_source = source
         self._playback_recovery_started_at = self.hass.loop.time()
+        self._policy_readmission_blocker = None
+        self._policy_readmission_last_attempt_at = self.hass.loop.time()
         self._playback_recovery_attempts = 0
         self._playback_action_log = next((row for row in self._log if row["action"] in (ACTION_RESUME, ACTION_START_RADIO)), None)
         self._set_playback_recovery("settling", health="settling")
@@ -1309,6 +1330,40 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _managed_playback_episode(self, inp: logic.Inputs) -> bool:
         return self._wake_start_owned or inp.planned_station_playing is True
 
+    def _maybe_schedule_policy_readmission(self, inp: logic.Inputs) -> None:
+        """Retry once when a transient Policy-start blocker clears."""
+        if inp.action not in (ACTION_START_RADIO, ACTION_RESUME):
+            self._policy_readmission_blocker = None
+            return
+        task = self._playback_recovery_task
+        if (
+            self._wake_start_owned
+            or (task is not None and not task.done())
+            or self._state(CONF_HOMEPODS_PLAYER) in PLAYER_PLAYING_VALUES
+            or self._playback_recovery_stage == "failed"
+        ):
+            return
+        reason = self._playback_start_block_reason(
+            inp, source="policy_readmission", admission=True
+        )
+        if reason in _POLICY_READMISSION_TRANSIENT_BLOCKERS:
+            self._policy_readmission_blocker = reason
+            return
+        if reason is not None:
+            self._policy_readmission_blocker = None
+            return
+        if self._policy_readmission_blocker is None:
+            return
+        now = self.hass.loop.time()
+        if (
+            self._policy_readmission_last_attempt_at is not None
+            and now - self._policy_readmission_last_attempt_at
+            < _POLICY_READMISSION_COOLDOWN
+        ):
+            return
+        source = "tv_resume" if inp.action == ACTION_RESUME else "policy"
+        self._schedule_resume_reconciliation(source=source, readmission=True)
+
     def _episode_group_has_played(self) -> bool:
         if self._playback_episode_seen_playing:
             return True
@@ -1329,7 +1384,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         gate_inp = self._resume_start_inputs(inp, source)
         if owner in ("", "none") and not seen_playing:
             gate_inp = replace(gate_inp, audio_owner="homepods")
-        if not admission or source == "policy":
+        if not admission or source in ("policy", "wake"):
             gate_inp = replace(gate_inp, homepods_resume_allowed=True)
         if admission and source == "wake":
             gate_inp = replace(gate_inp, stop_latch=False)
@@ -1421,6 +1476,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return "audio_owner_unproven"
         if owner in ("", "none") and not seen_playing:
             inp = replace(inp, audio_owner="homepods")
+        if inp.quiet_mode:
+            inp = replace(inp, quiet_mode=False)
         override = self._resume_user_override_reason()
         if override is not None:
             return override
