@@ -79,6 +79,30 @@ def test_shutdown_edge_cannot_be_a_new_screen_request():
     assert not step(state)[0].fire
 
 
+def test_ps5_to_residual_tv_fallback_after_shutdown_never_wakes():
+    """#57 live sequence: derived ps5 -> tv is not a positive wake intent."""
+    _, state = step(device="none", tv="on", tv_power_on=True)
+    _, state = step(state, device="ps5", tv="on", tv_power_on=True)
+    plan, state = step(state, device="ps5", tv="off", tv_power_on=True)
+    assert not plan.fire
+
+    plan, state = step(state, device="tv", tv="off", tv_power_on=True)
+    assert not plan.fire
+    assert not state.wol_available
+    assert state.last_consume_reason == "r12:shutdown_master_residual"
+    assert "r12:shutdown_master_residual" in plan.reasons
+
+    # Canonical convergence must not replay the consumed episode.
+    assert not step(state, device="tv", tv="off", tv_power_on=False)[0].fire
+
+
+def test_legitimate_screen_start_from_canonical_off_wakes_exactly_once():
+    _, state = step(device="ps5", tv="off", tv_power_on=False)
+    plan, state = step(state, device="tv", tv="off", tv_power_on=False)
+    assert plan.fire
+    assert not step(state, device="tv", tv="off", tv_power_on=False)[0].fire
+
+
 def test_unknown_tv_does_not_hide_shutdown_edge():
     _, state = step(device="none", tv="on")
     _, state = step(state, tv="unknown")
@@ -212,8 +236,13 @@ def test_compute_live_sequence_and_shadow(runtime, monkeypatch, shadow):  # noqa
 
     runtime.coord.hass.async_create_task = create_task
 
-    async def tick(device, tv):
-        runtime.inputs = replace(runtime.inputs, media_device=device, tv_player_state=tv)
+    async def tick(device, tv, tv_power_on=None):
+        runtime.inputs = replace(
+            runtime.inputs,
+            media_device=device,
+            tv_player_state=tv,
+            tv_power_on=tv_power_on,
+        )
         coord._compute()
         if tasks:
             await asyncio.gather(*tasks)
@@ -240,3 +269,43 @@ def test_compute_live_sequence_and_shadow(runtime, monkeypatch, shadow):  # noqa
 
     asyncio.run(run())
     assert all(action == "turn_on" for _, action, _ in runtime.calls)
+
+
+def test_compute_ps5_shutdown_fallback_does_not_schedule_wake(runtime, monkeypatch):  # noqa: F811
+    coord = runtime.coord
+    coord.entry.options[C.CONF_APPLY_ENABLED] = True
+    coord.entry.options[C.CONF_TV_PLAYER] = "media_player.test_tv"
+    for method in ("_schedule_execute", "_apply_nachlauf", "_dispatch_private_exit",
+                   "_reconcile_sleep_tv_tasks", "_persist_sleep_tv", "_schedule_stuck_mute_recovery"):
+        monkeypatch.setattr(coord, method, lambda *args, **kwargs: None)
+    runtime.inputs = replace(runtime.inputs, action=C.ACTION_NONE)
+    tasks = []
+
+    def create_task(coro):
+        task = asyncio.create_task(coro)
+        tasks.append(task)
+        return task
+
+    coord.hass.async_create_task = create_task
+
+    async def tick(device, tv, master):
+        runtime.inputs = replace(
+            runtime.inputs,
+            media_device=device,
+            tv_player_state=tv,
+            tv_power_on=master,
+        )
+        coord._compute()
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def run():
+        await tick("none", "on", True)
+        await tick("ps5", "on", True)
+        await tick("ps5", "off", True)
+        await tick("tv", "off", True)
+        await tick("tv", "off", False)
+
+    asyncio.run(run())
+    assert runtime.calls == []
+    assert coord._tv_wol_state.last_consume_reason == "r12:shutdown_master_residual"

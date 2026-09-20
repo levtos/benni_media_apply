@@ -1316,6 +1316,22 @@ def _tv_is_off(inp: "Inputs") -> Optional[bool]:
     return not inp.tv_power_on
 
 
+def _tv_master_residual_after_shutdown(inp: "Inputs") -> bool:
+    """True when raw WebOS is off but the canonical master still says powered.
+
+    This is existing shutdown evidence, not a new screen-wake intent.  It is
+    deliberately narrower than source arbitration: Apply only compares the two
+    TV signals it already consumes for R11/R12.
+    """
+    state = inp.tv_player_state
+    return (
+        state is not None
+        and state not in ("unknown", "unavailable")
+        and state in PLAYER_OFF_VALUES
+        and inp.tv_power_on is True
+    )
+
+
 def _sleep_tv_is_off(inp: "Inputs") -> Optional[bool]:
     """Issue #59 TV evidence from the canonical TV Master only.
 
@@ -1368,7 +1384,10 @@ def decide_tv_wol(
             else:
                 ns.consume("r12:startup_screen_unproven")
         ns.initialized = True
-        if shutdown_edge:
+        if _tv_master_residual_after_shutdown(inp):
+            ns.consume("r12:shutdown_master_residual")
+            ns.suppressed_reason = "r12:shutdown_master_residual"
+        elif shutdown_edge:
             ns.consume("r12:tv_shutdown_edge")
         elif tv_off is False and (ns.wol_available or ns.pending):
             ns.consume("r12:tv_already_on")
