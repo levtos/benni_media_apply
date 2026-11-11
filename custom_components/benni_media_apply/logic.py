@@ -35,6 +35,7 @@ from .const import (
     DEFAULT_DUCKED_LEVEL,
     DEFAULT_RADIO_DISPATCH_COOLDOWN,
     DEFAULT_RADIO_DISPATCH_MAX_BACKOFF,
+    DEFAULT_RADIO_STATION,
     DEFAULT_SLEEP_TV_OFF_CONFIRM,
     DEFAULT_SLEEP_TV_OFF_DELAY,
     DEFAULT_RAMP_STEP_DELAY,
@@ -49,6 +50,7 @@ from .const import (
     PLAYER_OFF_VALUES,
     PLAYER_PLAYING_VALUES,
     RADIO_CATALOG,
+    RADIO_FALLBACK_CATALOG,
     RADIO_STATION_LABELS,
     SCREEN_DEVICES,
 )
@@ -282,6 +284,22 @@ def resolve_radio_uri(station: Optional[str]) -> Optional[str]:
     if not station:
         return None
     return RADIO_CATALOG.get(station)
+
+
+def radio_uri_identity(uri: str | None) -> str | None:
+    """TuneIn domain/instance URIs identify the same station; library stays opaque."""
+    if not isinstance(uri, str):
+        return None
+    provider, separator, item = uri.partition("://")
+    if separator and provider.split("--", 1)[0] == "tunein":
+        return "tunein://" + item
+    return uri
+
+
+def radio_fallback_uri(uri: str | None) -> str | None:
+    """Only a known RB station may switch provider, never an unrelated resume."""
+    return next((RADIO_FALLBACK_CATALOG[key] for key, primary in RADIO_CATALOG.items()
+                 if primary == uri), None)
 
 
 def screen_blocks_music_start(inp: "Inputs") -> bool:
@@ -644,12 +662,12 @@ def presence_holds(inp: "Inputs") -> bool:
 
 def radio_defaults() -> list[dict[str, str]]:
     """Default-Sender als Shortcut-Liste fürs Cockpit: [{key, name, uri}].
-    Name aus RADIO_STATION_LABELS (Fallback: Key), sortiert nach Anzeigenamen."""
+    Jack first, remaining stations sorted by display name."""
     out = [
         {"key": key, "name": RADIO_STATION_LABELS.get(key, key), "uri": uri}
         for key, uri in RADIO_CATALOG.items()
     ]
-    return sorted(out, key=lambda s: s["name"].lower())
+    return sorted(out, key=lambda s: (s["key"] != DEFAULT_RADIO_STATION, s["name"].lower()))
 
 
 def _direct(current: Optional[float], target: Optional[float]) -> list[float]:

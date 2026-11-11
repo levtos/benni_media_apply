@@ -41,6 +41,10 @@ nicht (non-regressiv).
 
 ## Wake-Playback-Recovery (#41)
 
+Radio catalogue, Jack FM Deutschland default, source shortcuts, content-confirmed
+health and the bounded TuneIn fallback are documented in
+[Radio starts and provider fallback](docs/radio-start-provider-fallback.md) (#60).
+
 Ein Wake-Start ist **single-flight**: `music_assistant.play_media` mit
 `enqueue=replace` ist der einzige Start-Owner. Parallele Policy-Resumes und der
 frühere verzögerte `media_player.media_play`-Impuls werden während der
