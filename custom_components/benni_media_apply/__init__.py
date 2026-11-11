@@ -15,6 +15,7 @@ from homeassistant.core import HomeAssistant
 
 from .const import DATA_COORDINATOR, DOMAIN, LEGACY_ENTITY_MAP
 from .coordinator import MediaApplyCoordinator
+from .services import async_remove_services, async_setup_services
 from .view import async_remove_view
 from .websocket_api import async_setup_websocket_api
 
@@ -57,6 +58,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     domain_data = hass.data.setdefault(DOMAIN, {})
     domain_data[entry.entry_id] = {DATA_COORDINATOR: coord}
+    async_setup_services(hass)
 
     # WS-Contract einmalig registrieren (Single-Instance, aber gegen Mehrfach-Setup
     # geschützt). Der Flag-Key ist kein dict → vom _coordinator()-Scan ignoriert.
@@ -99,5 +101,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if isinstance(v, dict) and DATA_COORDINATOR in v
         ]
         if not remaining:
+            async_remove_services(hass)
             async_remove_view(hass)
     return unloaded

@@ -83,7 +83,6 @@ from .const import (
     CONF_SLEEP_TV_WARN_LEAD,
     CONF_SLEEP_TV_WARN_MESSAGE,
     CONF_RADIO_READY,
-    CONF_RADIO_START_SCRIPT,
     CONF_RADIO_STATION,
     CONF_RAMP_STEP_DELAY,
     CONF_RAMP_STEPS,
@@ -126,7 +125,6 @@ from .const import (
     DEFAULT_RADIO_AUTOSTART,
     DEFAULT_RADIO_RESUME_DELAY,
     DEFAULT_RADIO_SEARCH_LIMIT,
-    DEFAULT_RADIO_START_SCRIPT,
     DEFAULT_RADIO_STATION,
     DEFAULT_SLEEP_TV_NOTIFY,
     DEFAULT_SLEEP_TV_OFF_CONFIRM,
@@ -2185,11 +2183,11 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "enqueue": RADIO_ENQUEUE,
             "source": source,
         }
-        # Owned starts cannot delegate to a script that may add another play.
+        # Every radio start requires a direct URI; no external script fallback.
         invalid = None
         if not isinstance(hp, str) or not hp.startswith("media_player.") or self.hass.states.get(hp) is None:
             invalid = "target_player_missing_or_invalid"
-        elif self._wake_start_owned and not media_id:
+        elif not media_id:
             invalid = "media_id_missing"
         elif media_id is not None and (not isinstance(media_id, str) or "://" not in media_id or not media_id.split("://", 1)[1] or any(char.isspace() for char in media_id)):
             invalid = "media_id_invalid"
@@ -2247,18 +2245,13 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     },
                     blocking=True,
                 )
-            else:
-                radio = self._opts.get(CONF_RADIO_START_SCRIPT, DEFAULT_RADIO_START_SCRIPT)
-                await self.hass.services.async_call(
-                    "script", "turn_on", {"entity_id": radio}, blocking=True
-                )
             self._radio_dispatch_result(success=True)
             if self._playback_action_log is not None:
                 self._playback_action_log["dispatched"] = True
             _LOGGER.info(
                 "media_apply: automatic radio dispatch (%s) → %s",
                 source,
-                self._radio_dispatch_payload["media_scheme"] if media_id else "script",
+                self._radio_dispatch_payload["media_scheme"],
             )
             return True
         except asyncio.CancelledError:
@@ -2740,6 +2733,42 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self._svc("media_player", "turn_off", {"entity_id": denon})
 
     # ----- Radio-Shortcuts (manuell, Phase 4b) -----
+    async def async_start_radio(self) -> None:
+        """Request the planned station through the existing single flight."""
+        hp = self._entity_id(CONF_HOMEPODS_PLAYER)
+        if not hp or self.hass.states.get(hp) is None:
+            raise ValueError("HomePods player is not bound or available")
+        if self._wake_start_owned or self._state(CONF_HOMEPODS_PLAYER) in PLAYER_PLAYING_VALUES:
+            return
+        self._schedule_resume_reconciliation(source="policy", readmission=True)
+
+    def _radio_control_entity(self, key: str) -> str:
+        entity = self._entity_id(key)
+        state = self.hass.states.get(entity) if entity else None
+        if state is None or state.state in ("unknown", "unavailable"):
+            raise ValueError(f"Radio control binding unavailable: {key}")
+        return entity
+
+    async def async_clear_stop_latch(self) -> None:
+        """Explicit latch release; never starts playback itself."""
+        latch = self._radio_control_entity(CONF_STOP_LATCH)
+        await self.hass.services.async_call("homeassistant", "turn_off", {"entity_id": latch}, blocking=True)
+
+    async def async_stop_radio(self) -> None:
+        """Explicit stop owns cancellation and the existing persistent latch."""
+        latch = self._radio_control_entity(CONF_STOP_LATCH)
+        player = self._entity_id(CONF_HOMEPODS_PLAYER)
+        if not player:
+            raise ValueError("HomePods player is not bound")
+        self._cancel_playback_recovery("manual_stop")
+        self._cancel_radio_resume()
+        self._cancel_stuck_mute_recovery()
+        self._cancel_wake()
+        self._cancel_ramp()
+        self._cancel_debounce()
+        await self.hass.services.async_call("homeassistant", "turn_on", {"entity_id": latch}, blocking=True)
+        await self.hass.services.async_call("media_player", "media_stop", {"entity_id": player}, blocking=True)
+
     def _ma_config_entry_id(self) -> Optional[str]:
         """Config-Entry der Music-Assistant-Integration (für den Search-Service)."""
         for entry in self.hass.config_entries.async_entries("music_assistant"):

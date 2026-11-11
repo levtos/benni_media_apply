@@ -44,6 +44,8 @@ nicht (non-regressiv).
 Radio catalogue, Jack FM Deutschland default, source shortcuts, content-confirmed
 health and the bounded TuneIn fallback are documented in
 [Radio starts and provider fallback](docs/radio-start-provider-fallback.md) (#60).
+Since 0.19.18 the three legacy radio scripts are replaced by
+[native integration actions](docs/radio-services.md) (#62).
 
 Ein Wake-Start ist **single-flight**: `music_assistant.play_media` mit
 `enqueue=replace` ist der einzige Start-Owner. Parallele Policy-Resumes und der

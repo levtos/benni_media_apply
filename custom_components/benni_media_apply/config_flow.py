@@ -37,7 +37,6 @@ from .const import (
     CONF_PROFILE,
     CONF_RADIO_AUTOSTART,
     CONF_RADIO_RESUME_DELAY,
-    CONF_RADIO_START_SCRIPT,
     CONF_RAMP_STEP_DELAY,
     CONF_RAMP_STEPS,
     CONF_SLEEP_TV_NOTIFY,
@@ -67,7 +66,6 @@ from .const import (
     DEFAULT_PROFILE,
     DEFAULT_RADIO_AUTOSTART,
     DEFAULT_RADIO_RESUME_DELAY,
-    DEFAULT_RADIO_START_SCRIPT,
     DEFAULT_SLEEP_TV_NOTIFY,
     DEFAULT_SLEEP_TV_OFF_DELAY,
     DEFAULT_SLEEP_TV_WARN_LEAD,
@@ -91,7 +89,6 @@ from .const import (
 _ENTITY = selector.EntitySelector(selector.EntitySelectorConfig())
 _PLAYER = selector.EntitySelector(selector.EntitySelectorConfig(domain="media_player"))
 _SWITCH = selector.EntitySelector(selector.EntitySelectorConfig(domain="switch"))
-_SCRIPT = selector.EntitySelector(selector.EntitySelectorConfig(domain="script"))
 _BOOL = selector.BooleanSelector()
 
 _PLAYER_KEYS = (CONF_HOMEPODS_PLAYER, CONF_DENON_PLAYER, CONF_TV_PLAYER)
@@ -197,8 +194,6 @@ def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
     }
     for key, (default, coerce) in _RAMP_FIELDS.items():
         fields[vol.Optional(key, default=defaults.get(key, default))] = coerce
-    radio_default = defaults.get(CONF_RADIO_START_SCRIPT, DEFAULT_RADIO_START_SCRIPT)
-    fields[vol.Optional(CONF_RADIO_START_SCRIPT, default=radio_default)] = _SCRIPT
     app_id_default = defaults.get(
         CONF_MUSIC_ASSISTANT_APP_ID, DEFAULT_MUSIC_ASSISTANT_APP_ID
     )
