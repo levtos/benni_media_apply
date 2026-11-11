@@ -279,8 +279,7 @@ def ramp_levels(
 
 
 def resolve_radio_uri(station: Optional[str]) -> Optional[str]:
-    """Sender-Key → radiobrowser-URI (Phase 4b Katalog-Port). None bei
-    ungebundenem/unbekanntem Sender ⇒ Coordinator fällt auf das YAML-Script zurück."""
+    """Station key to preferred URI; unknown stations fail visibly at dispatch."""
     if not station:
         return None
     return RADIO_CATALOG.get(station)

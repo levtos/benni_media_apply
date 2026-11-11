@@ -48,6 +48,7 @@ additive `radio_content_ids` attribute on Playback Health for runtime search ali
 Deploy the configuration companion together with this integration; old exact-RB-only
 templates would misclassify TuneIn/library playback as manual. The manual YAML
 start script must not add another delayed `media_play` after `play_media(replace)`.
+Since 0.19.18 that script is retired entirely; see [Native radio actions](radio-services.md).
 
 On an installation restoring GAYFM, Benni selects Jack once as part of activation.
 Do not add an `initial` value that would reset an intentionally chosen station on

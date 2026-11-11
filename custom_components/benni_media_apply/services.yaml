@@ -1,0 +1,9 @@
+start_radio:
+  name: Start planned radio
+  description: Request the selected station through the existing single-flight start and recovery path. Respects Apply, Stop, Sleep, manual playback and audio-owner gates. Does not clear the stop latch.
+stop_radio:
+  name: Stop radio
+  description: Cancel pending radio work, set the configured stop latch and stop the configured HomePod player. This is an explicit user action, available in Shadow mode.
+clear_stop_latch:
+  name: Clear radio stop latch
+  description: Clear the configured stop latch without issuing a playback command. Normal policy evaluation may subsequently permit playback. Available in Shadow mode.

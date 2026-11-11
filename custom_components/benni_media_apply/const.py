@@ -4,8 +4,8 @@ Eigenständige HA-Integration. Konsumiert benni_media_state (Szenario) +
 benni_media_policy (Targets/Action/Gates) AUSSCHLIESSLICH über HA-Entity-State —
 kein Cross-Modul-Python-Import (Contracts werden KOPIERT, nicht importiert).
 
-Phase 1 (FLEET-40): Kern-Apply — HomePods-Action (pause/play; start_radio
-delegiert an script.media_radio_start), Volume (HomePods geramped, Denon hart),
+Kern-Apply — HomePods-Action (pause/play; integration-owned radio start),
+Volume (HomePods geramped, Denon hart),
 Subwoofer on/off. Apply-Gate: apply_enabled (Option, Shadow-safe OFF) ×
 volume_apply_allowed (pro Entscheidung, aus media_policy).
 
@@ -279,8 +279,8 @@ CONF_DEBOUNCE_MAX_WAIT: Final[str] = "debounce_max_wait_seconds"
 # feststehen. Die HomePods-Rampe bleibt davon unberührt (bewusst sanft, 16×1s).
 # Ausschaltbar, falls sich am AVR doch ein Flacker-Effekt zeigt.
 CONF_DENON_IMMEDIATE: Final[str] = "denon_immediate_volume"
-# Service-Delegation für start_radio — Fallback, wenn kein URI auflösbar
-# (Sender ungebunden/unbekannt). Phase 4b portiert den Katalog inline.
+# Retired option, ignored since 0.19.18. Existing entries may retain the key;
+# all radio starts are integration-owned and never delegate to YAML scripts.
 CONF_RADIO_START_SCRIPT: Final[str] = "radio_start_script"
 # Legacy-Option aus <= 0.19.4. Music Assistants play_media startet die Wiedergabe
 # selbst; der nachgelagerte media_play-Pfad wurde in 0.19.5 entfernt. Der Key
@@ -294,7 +294,6 @@ DEFAULT_DUCKED_LEVEL: Final[float] = 0.10
 DEFAULT_DEBOUNCE_SECONDS: Final[float] = 5.0
 DEFAULT_DEBOUNCE_MAX_WAIT: Final[float] = 8.0
 DEFAULT_DENON_IMMEDIATE: Final[bool] = True
-DEFAULT_RADIO_START_SCRIPT: Final[str] = "script.media_radio_start"
 DEFAULT_RADIO_PLAY_DELAY: Final[float] = 2.0
 # Automatic radio dispatch protection: a failed provider must not be retriggered
 # by every HomePod state flap. Manual cockpit playback deliberately bypasses it.

@@ -6,8 +6,9 @@ import pytest
 import bma_const as C
 import bma_logic as L
 from tests.test_resume_reconciliation import remember_content, run_resume
+from tests.test_resume_reconciliation import runtime as _runtime
 
-pytest_plugins = ["tests.test_resume_reconciliation"]
+runtime = _runtime
 
 
 @pytest.mark.parametrize("source", ["wake", "policy", "resume", "tv_resume"])
