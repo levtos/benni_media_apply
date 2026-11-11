@@ -1205,8 +1205,9 @@ def test_radio_defaults_shape_and_sort():
     d = L.radio_defaults()
     assert len(d) == len(C.RADIO_CATALOG)
     assert all({"key", "name", "uri"} <= set(s) for s in d)
-    # nach Anzeigenamen sortiert (1LIVE vor WDR …)
-    names = [s["name"].lower() for s in d]
+    # #60: Jack is the default; remaining stations retain name order.
+    assert d[0]["key"] == C.DEFAULT_RADIO_STATION
+    names = [s["name"].lower() for s in d[1:]]
     assert names == sorted(names)
     # jeder Eintrag trägt die korrekte URI aus dem Katalog
     assert all(s["uri"] == C.RADIO_CATALOG[s["key"]] for s in d)

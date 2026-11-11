@@ -307,10 +307,21 @@ DEFAULT_RADIO_DISPATCH_MAX_BACKOFF: Final[float] = 120.0
 RADIO_CATALOG: Final[dict[str, str]] = {
     "1live": "radiobrowser://radio/b2cbd1fd-275d-432a-8b20-37dcb3572315",
     "wdr2_bergisches_land": "radiobrowser://radio/960c0309-0601-11e8-ae97-52543be04c81",
-    "gayfm": "radiobrowser://radio/960eb9c7-0601-11e8-ae97-52543be04c81",
-    "ndr1_niedersachsen": "radiobrowser://radio/b6240170-f81f-4fc7-9183-5f9ebbe8b8d8",
-    "wdr4": "radiobrowser://radio/905f3c23-60fc-4636-9e82-9d33078b8793",
-    "jack_fm_berlin": "radiobrowser://radio/96109543-0601-11e8-ae97-52543be04c81",
+    "gayfm": "radiobrowser://radio/c3776781-8b87-414c-9f03-a751fc447fc6",
+    "ndr1_niedersachsen": "radiobrowser://radio/98ff7177-c10d-4288-b1e3-9fbd4965c51e",
+    "wdr4": "radiobrowser://radio/ccdcc4a2-9a79-41d4-8ca1-ff3d9c54a6a2",
+    "jack_fm_berlin": "radiobrowser://radio/f39ed8f8-1b01-411c-a3e4-0a1f42124e72",
+}
+# Keep the existing selector key for restored choices. MA resolves provider
+# domains to the loaded instance; no private TuneIn instance ID belongs here.
+DEFAULT_RADIO_STATION: Final[str] = "jack_fm_berlin"
+RADIO_FALLBACK_CATALOG: Final[dict[str, str]] = {
+    "1live": "tunein://radio/s25260",
+    "wdr2_bergisches_land": "tunein://radio/s99174",
+    "gayfm": "tunein://radio/s96482",
+    "ndr1_niedersachsen": "tunein://radio/s25529",
+    "wdr4": "tunein://radio/s324638",
+    "jack_fm_berlin": "tunein://radio/s84493",
 }
 RADIO_MEDIA_TYPE: Final[str] = "radio"
 RADIO_ENQUEUE: Final[str] = "replace"
@@ -357,8 +368,14 @@ RADIO_STATION_LABELS: Final[dict[str, str]] = {
     "wdr2_bergisches_land": "WDR 2 Bergisches Land",
     "gayfm": "GAYFM",
     "ndr1_niedersachsen": "NDR 1 Niedersachsen",
-    "wdr4": "WDR 4",
-    "jack_fm_berlin": "Jack FM Berlin",
+    "wdr4": "WDR 4 Rhein und Ruhr",
+    "jack_fm_berlin": "Jack FM Deutschland",
+}
+# Exact provider names only; never fuzzy-match a different country/region.
+RADIO_SEARCH_NAMES: Final[dict[str, tuple[str, ...]]] = {
+    "jack_fm_berlin": ("Jack FM Deutschland", "Jack FM"),
+    "gayfm": ("GAYFM", "GAY FM - Pure Dance!", "Gay FM"),
+    "wdr4": ("WDR 4 Rhein und Ruhr", "WDR 4"),
 }
 # MA-Suche (Phase 4b — „andere Sender"). Default-Trefferzahl.
 DEFAULT_RADIO_SEARCH_LIMIT: Final[int] = 10

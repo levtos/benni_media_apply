@@ -100,7 +100,7 @@ def runtime(monkeypatch):
             env.states[env.latch_entity].state = "off"
             env.inputs = replace(env.inputs, stop_latch=False)
 
-    hass = types.SimpleNamespace(states=types.SimpleNamespace(get=env.states.get), services=types.SimpleNamespace(async_call=service), loop=types.SimpleNamespace(time=lambda: env.now), async_create_task=asyncio.create_task)
+    hass = types.SimpleNamespace(config_entries=types.SimpleNamespace(async_entries=lambda domain: []), states=types.SimpleNamespace(get=env.states.get), services=types.SimpleNamespace(async_call=service), loop=types.SimpleNamespace(time=lambda: env.now), async_create_task=asyncio.create_task)
     options = {C.CONF_APPLY_ENABLED: True, C.CONF_HOMEPODS_PLAYER: group, C.CONF_HOMEPODS_PODS: pods, C.CONF_BIO_STATE: env.bio_entity, C.CONF_STOP_LATCH: env.latch_entity}
     entry = types.SimpleNamespace(data={}, options=options, entry_id="test")
     coord = module.MediaApplyCoordinator(hass, entry)

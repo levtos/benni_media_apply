@@ -127,6 +127,7 @@ from .const import (
     DEFAULT_RADIO_RESUME_DELAY,
     DEFAULT_RADIO_SEARCH_LIMIT,
     DEFAULT_RADIO_START_SCRIPT,
+    DEFAULT_RADIO_STATION,
     DEFAULT_SLEEP_TV_NOTIFY,
     DEFAULT_SLEEP_TV_OFF_CONFIRM,
     DEFAULT_SLEEP_TV_OFF_DELAY,
@@ -146,7 +147,9 @@ from .const import (
     PLAYER_OFF_VALUES,
     PLAYER_PLAYING_VALUES,
     RADIO_ENQUEUE,
+    RADIO_FALLBACK_CATALOG,
     RADIO_MEDIA_TYPE,
+    RADIO_SEARCH_NAMES,
     SCREEN_DEVICES,
     PROFILE_PREFILL,
     PROFILES,
@@ -262,6 +265,10 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._log: deque[dict[str, Any]] = deque(maxlen=20)
         self._last_log_sig: tuple | None = None
         self._radio_shortcuts_cache: list[dict[str, Any]] | None = None
+        self._radio_shortcuts_cached_at: dict[str, float] = {}
+        self._radio_expected_uri: str | None = None
+        self._radio_start_error: str | None = None
+        self._radio_provider_errors: list[str] = []
 
     async def async_load_stored(self) -> None:
         """Load Issue #59's restart-safe absolute deadlines before first refresh."""
@@ -1232,6 +1239,9 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._playback_action_log = None
         self._playback_recovery_attempts = 0
         self._playback_recovery_started_at = self.hass.loop.time()
+        self._radio_expected_uri = None
+        self._radio_start_error = None
+        self._radio_provider_errors = []
         self._playback_recovery_task = self.hass.async_create_task(
             self._run_radio_autostart()
         )
@@ -1277,6 +1287,9 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._policy_readmission_last_attempt_at = self.hass.loop.time()
         self._playback_recovery_attempts = 0
         self._playback_action_log = next((row for row in self._log if row["action"] in (ACTION_RESUME, ACTION_START_RADIO)), None)
+        self._radio_expected_uri = None
+        self._radio_start_error = None
+        self._radio_provider_errors = []
         self._set_playback_recovery("settling", health="settling")
         self._playback_recovery_task = self.hass.async_create_task(self._run_radio_autostart(source=source))
 
@@ -1315,6 +1328,9 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _playback_health_attrs(self) -> dict[str, Any]:
         return {
+            "radio_content_ids": {row["key"]: row.get("content_ids", [row["uri"]]) for row in (self._radio_shortcuts_cache or [])},
+            "radio_start_error": self._radio_start_error,
+            "radio_provider_errors": list(self._radio_provider_errors),
             "reason": self._playback_health_reason,
             "source": self._playback_recovery_source,
             "attempts": self._playback_recovery_attempts,
@@ -1440,7 +1456,12 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
         current = self._media_content_value(state_obj, "media_content_id")
         expected = self._resume_episode_expected_content_id
-        if expected is not None and current is not None and current != expected:
+        matches = self._radio_content_matches(current, expected)
+        if expected is not None and current is not None and not matches:
+            # A fallback with no saved content has not established a session yet.
+            # Its stale/failed queue is evidence for health, not a user override.
+            if self._resume_content_id is None and not self._resume_episode_seen_playing:
+                return None
             return "resume_content_changed"
         if state_obj.state in PLAYER_PLAYING_VALUES:
             self._resume_episode_seen_playing = True
@@ -1494,7 +1515,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 if owned_pause or (
                     state_obj.state in PLAYER_PLAYING_VALUES
-                    and (expected is None or current is None or current == expected)
+                    and (expected is None or current is None or self._radio_content_matches(current, expected))
                 ):
                     inp = replace(inp, manual_playback=False)
         return logic.playback_repair_block_reason(
@@ -1517,7 +1538,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         content_type = (self._resume_content_type or "").lower()
         return content_type in {"radio", "channel"} or bool(
             self._resume_content_id
-            and self._resume_content_id.startswith("radiobrowser://")
+            and self._resume_content_id.startswith(("radiobrowser://", "tunein://", "tunein--", "library://radio/"))
         )
 
     async def _dispatch_resume_media_play(self) -> bool:
@@ -1613,7 +1634,21 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self._supports_volume_mute(self.hass.states.get(entity_id))
         )
 
+    def _radio_content_matches(self, current: str | None, expected: str | None) -> bool:
+        aliases = {logic.radio_uri_identity(expected)}
+        for row in self._radio_shortcuts_cache or []:
+            ids = row.get("content_ids", [row["uri"]])
+            if logic.radio_uri_identity(expected) in {logic.radio_uri_identity(uri) for uri in ids}:
+                aliases.update(logic.radio_uri_identity(uri) for uri in ids)
+        return logic.radio_uri_identity(current) in aliases
+
     def _playback_health_snapshot(self) -> logic.PlaybackHealth:
+        if self._wake_start_owned and self._radio_expected_uri:
+            if self._radio_start_error:
+                return logic.PlaybackHealth("unhealthy", self._radio_start_error)
+            current = self._attr(CONF_HOMEPODS_PLAYER, "media_content_id")
+            if not self._radio_content_matches(current, self._radio_expected_uri):
+                return logic.PlaybackHealth("unhealthy", "radio_content_unconfirmed")
         group_state, _pods, pod_states, pod_muted = self._playback_member_snapshot()
         return logic.playback_health(
             group_state=group_state,
@@ -1840,7 +1875,14 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 return
             self._playback_episode_admitted = True
-            uri = logic.resolve_radio_uri(inp.radio_station)
+            # Resolve inside the single flight; dispatch rechecks current gates.
+            shortcuts = await self.async_radio_shortcuts(station_key=inp.radio_station) if inp.radio_station else []
+            if source == "tv_resume":
+                saved_key = next((row["key"] for row in logic.radio_defaults() if row["uri"] == self._resume_content_id), None)
+                if saved_key and saved_key != inp.radio_station:
+                    shortcuts += await self.async_radio_shortcuts(station_key=saved_key)
+            station = next((row for row in shortcuts if row["key"] == inp.radio_station), None)
+            uri = station["uri"] if station else logic.resolve_radio_uri(inp.radio_station)
             fallback_dispatched = False
             if source == "tv_resume":
                 if self._state(CONF_HOMEPODS_PLAYER) not in PLAYER_PLAYING_VALUES:
@@ -1856,7 +1898,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             require_positive_target=False,
                         )
                         self._resume_episode_dispatched = fallback_dispatched
-                        if not fallback_dispatched:
+                        if not fallback_dispatched and self._radio_start_error is None:
                             self._set_playback_recovery(
                                 "failed",
                                 health="unhealthy",
@@ -1865,34 +1907,39 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             )
                             return
             elif logic.should_autostart_radio(inp):
-                await self._dispatch_automatic_radio(uri, source="wake_autostart" if not is_resume else source)
+                dispatched = await self._dispatch_automatic_radio(uri, source="wake_autostart" if not is_resume else source)
+                if not dispatched and self._radio_start_error is None:
+                    self._set_playback_recovery("failed", health="unhealthy", reason=self._radio_dispatch_state.last_error or "radio_dispatch_blocked")
+                    return
 
             # play_media startet selbst. Nach kurzem Settle explizit entstummen;
             # der alte zusätzliche media_play-Impuls war Teil des Lock-Races.
             self._set_playback_recovery("settling", health="settling")
             if not await self._recovery_sleep(2.0, require_positive_target=False):
                 return
-            if await self._wait_for_playing_homepods():
+            if not self._radio_start_error and await self._wait_for_playing_homepods():
                 await self._unmute_homepods(
                     source=f"{source}_initial", force_all=True
                 )
 
             if not self._playback_recovery_enabled:
-                if is_resume:
-                    health = await self._stable_playback_health()
-                    if health.state == "cancelled":
-                        return
+                health = await self._stable_playback_health()
+                if health.state == "cancelled":
+                    return
+                provider_fault = self._radio_expected_uri and (
+                    self._radio_start_error or health.reason == "radio_content_unconfirmed"
+                    or (health.reason or "").startswith("group_")
+                )
+                if not provider_fault:
                     self._set_playback_recovery("healthy" if health.state == "healthy" else "failed", health=health.state, reason=health.reason)
-                else:
-                    self._set_playback_recovery("complete", health="unmonitored")
-                return
+                    return
 
             settle = self._duration(
                 CONF_PLAYBACK_RECOVERY_SETTLE, DEFAULT_PLAYBACK_RECOVERY_SETTLE
             )
             elapsed = self.hass.loop.time() - (self._playback_recovery_started_at or 0.0)
             if not await self._recovery_sleep(
-                max(0.0, settle - elapsed),
+                0.0 if self._radio_start_error else max(0.0, settle - elapsed),
                 require_positive_target=False,
             ):
                 return
@@ -1910,10 +1957,18 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "soft_recovery", health=health.state, reason=health.reason
             )
             if source == "tv_resume" and self._resume_content_id is None:
-                dispatched = fallback_dispatched
-            elif source == "tv_resume" and self._resume_content_is_radio():
+                uri = (station or {}).get("fallback_uri") or logic.radio_fallback_uri(uri) or uri
+                self._resume_episode_expected_content_id = uri
                 dispatched = await self._dispatch_automatic_radio(
-                    self._resume_content_id,
+                    uri, source="tv_resume_provider_fallback", replace_existing=True,
+                    bypass_circuit=True, require_positive_target=False,
+                )
+            elif source == "tv_resume" and self._resume_content_is_radio():
+                # Resume the saved station, never the currently selected plan.
+                saved_station = next((row for row in shortcuts if row["uri"] == self._resume_content_id), None)
+                resume_uri = (saved_station or {}).get("fallback_uri") or logic.radio_fallback_uri(self._resume_content_id) or self._resume_content_id
+                dispatched = await self._dispatch_automatic_radio(
+                    resume_uri,
                     source="tv_resume_soft_recovery",
                     replace_existing=True,
                     bypass_circuit=True,
@@ -1922,18 +1977,18 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             elif source == "tv_resume":
                 dispatched = await self._dispatch_resume_media_play()
             else:
+                # The existing single soft replace is also the provider fallback.
+                # Mute-only faults keep the original source; content/start faults
+                # may switch only to the same known station on TuneIn.
+                if self._radio_start_error or health.reason == "radio_content_unconfirmed" or (health.reason or "").startswith("group_"):
+                    uri = (station or {}).get("fallback_uri") or logic.radio_fallback_uri(uri) or uri
                 dispatched = await self._dispatch_automatic_radio(
                     uri,
                     source=f"{source}_soft_recovery",
                     replace_existing=True,
                     bypass_circuit=True,
                 )
-            if source == "tv_resume" and self._resume_content_id is None:
-                self._set_playback_recovery(
-                    "failed", health=health.state, reason=health.reason
-                )
-                return
-            if is_resume and not dispatched:
+            if not dispatched:
                 self._set_playback_recovery("failed", health="unhealthy", reason=self._radio_dispatch_state.last_error or "recovery_dispatch_blocked")
                 return
             if not await self._recovery_sleep(2.0, require_positive_target=False):
@@ -1953,7 +2008,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._set_playback_recovery("healthy", health="healthy")
                 return
 
-            if is_resume:
+            if is_resume or not self._playback_recovery_enabled:
                 # Normal resume has one bounded replace, no periodic recovery
                 # and no implicit extension of the Wake-only app restart gate.
                 self._set_playback_recovery("failed", health=health.state, reason=health.reason)
@@ -2125,7 +2180,7 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "target_bound": isinstance(hp, str) and hp.startswith("media_player."),
             "media_id_present": bool(media_id),
             "media_id_type": type(media_id).__name__,
-            "media_scheme": next((scheme for scheme in ("http", "https", "radiobrowser", "library") if isinstance(media_id, str) and media_id.startswith(scheme + "://")), "other" if media_id else None),
+            "media_scheme": (logic.radio_uri_identity(media_id) or "").split("://", 1)[0] or None,
             "media_type": RADIO_MEDIA_TYPE,
             "enqueue": RADIO_ENQUEUE,
             "source": source,
@@ -2177,6 +2232,10 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return False
         try:
             if media_id:
+                self._radio_expected_uri = media_id
+                self._radio_start_error = None
+                if self._playback_recovery_source == "tv_resume":
+                    self._resume_episode_expected_content_id = media_id
                 await self.hass.services.async_call(
                     "music_assistant",
                     "play_media",
@@ -2206,6 +2265,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise
         except Exception as err:  # noqa: BLE001 — provider failure is circuit-breaker input.
             safe_error = RuntimeError(f"provider_dispatch_failed:{type(err).__name__}")
+            self._radio_start_error = str(safe_error)
+            self._radio_provider_errors.append(str(safe_error))
             self._radio_dispatch_result(success=False, error=safe_error)
             _LOGGER.warning("media_apply: automatic radio dispatch (%s) failed: %s", source, safe_error)
             return False
@@ -2696,6 +2757,8 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise ValueError("HomePods-Player nicht gebunden")
         if not media_id:
             raise ValueError("media_id fehlt")
+        self._cancel_playback_recovery("manual_playback")
+        self._cancel_radio_resume()
         await self._svc(
             "music_assistant", "play_media",
             {
@@ -2739,23 +2802,51 @@ class MediaApplyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             })
         return out
 
-    async def async_radio_shortcuts(self) -> list[dict[str, Any]]:
+    async def async_radio_shortcuts(self, *, station_key: str | None = None) -> list[dict[str, Any]]:
         """Default-Sender mit Music-Assistant-Logo und Live-Markierung."""
-        if self._radio_shortcuts_cache is None:
-            enriched: list[dict[str, Any]] = []
-            for station in logic.radio_defaults():
-                matches = await self.async_search_radio(station["name"], 5)
+        defaults = [row for row in logic.radio_defaults() if station_key is None or row["key"] == station_key]
+        for station in defaults:
+            key = station["key"]
+            if key not in self._radio_shortcuts_cached_at or self.hass.loop.time() - self._radio_shortcuts_cached_at[key] >= 300.0:
+                search_names = RADIO_SEARCH_NAMES.get(key, (station["name"],))
+                matches = []
+                try:
+                    async with asyncio.timeout(5.0):
+                        if self._ma_config_entry_id():
+                            for name in search_names:
+                                matches.extend(await self.async_search_radio(name, 10))
+                except (TimeoutError, ValueError):
+                    pass  # Keep completed results; search must not hold up wake.
+                matches = list({item["uri"]: item for item in matches}.values())
+                names = {name.casefold() for name in search_names}
+                exact = [item for item in matches if str(item["name"]).casefold() in names]
+                rb = [item for item in exact if item["uri"].startswith("radiobrowser://")]
+                # Prefer RB and retain the verified baseline on ambiguity/no hits.
                 match = next((item for item in matches if item["uri"] == station["uri"]), None)
-                if match is None:
-                    target = station["name"].casefold()
-                    match = next((item for item in matches if str(item["name"]).casefold() == target), None)
-                enriched.append({**station, "image": (match or {}).get("image"), "favorite": bool((match or {}).get("favorite"))})
-            self._radio_shortcuts_cache = enriched
+                if match is None and len(rb) == 1:
+                    match = rb[0]
+                primary = (match or station)["uri"]
+                fallback = RADIO_FALLBACK_CATALOG[station["key"]]
+                tunein = next((item for item in matches if logic.radio_uri_identity(item["uri"]) == fallback), None)
+                fallback = (tunein or {}).get("uri", fallback)
+                library = [item for item in exact if item["uri"].startswith("library://")]
+                aliases = [item["uri"] for item in library if sum(other["name"].casefold() == item["name"].casefold() for other in library) == 1]
+                ids = list(dict.fromkeys([primary, fallback, *aliases]))
+                artwork = match or next(iter(exact), {})
+                enriched = {**station, "uri": primary, "fallback_uri": fallback, "content_ids": ids, "image": artwork.get("image"), "favorite": bool(artwork.get("favorite")), "default": key == DEFAULT_RADIO_STATION}
+                self._radio_shortcuts_cache = [row for row in (self._radio_shortcuts_cache or []) if row["key"] != key] + [enriched]
+                self._radio_shortcuts_cached_at[key] = self.hass.loop.time()
+        if self.data is not None:
+            self.async_set_updated_data({**self.data, "playback_health_attrs": self._playback_health_attrs()})
         inp = self._build_inputs()
-        return [
-            {**station, "playing": bool(inp.planned_station_playing and inp.radio_station == station.get("key"))}
-            for station in self._radio_shortcuts_cache
-        ]
+        current = logic.radio_uri_identity(self._attr(CONF_HOMEPODS_PLAYER, "media_content_id"))
+        out = []
+        for default in defaults:
+            station = next(row for row in self._radio_shortcuts_cache or [] if row["key"] == default["key"])
+            out.append({**station, "provider": "radiobrowser", "playing": bool(inp.planned_station_playing and inp.radio_station == station["key"] and current != logic.radio_uri_identity(station["fallback_uri"]))})
+            # Existing cockpit renders these as ordinary manual play buttons.
+            out.append({**station, "uri": station["fallback_uri"], "name": station["name"] + " (TuneIn)", "provider": "tunein", "default": False, "playing": self._state(CONF_HOMEPODS_PLAYER) in PLAYER_PLAYING_VALUES and current == logic.radio_uri_identity(station["fallback_uri"])})
+        return out
 
     # ----- service surface -----
     async def async_set_apply_enabled(self, value: bool) -> None:
